@@ -37,9 +37,25 @@ class DuplicateAdvanceError(OrchestratorError):
 
 
 class AdvanceConflictError(OrchestratorError):
-    """并发冲突：同一发布已有推进在执行中，本次调用未生效。"""
+    """并发冲突：同一发布已有在途操作（含其他进程持有该发布操作权），本次调用未生效。"""
 
     error_code = "advance_conflict"
+
+
+class StaleStateError(OrchestratorError):
+    """陈旧操作：本次变更基于过期进度，共享状态已被其他实例推进/完成/回滚。
+
+    属于"未生效"的拒绝：绝不用旧进度覆盖新结果。attach 的 record 为共享状态中
+    最新的发布记录，事件链中会追加 operation_rejected(reason=stale_state)。
+    """
+
+    error_code = "stale_state"
+
+
+class StorageBusyError(OrchestratorError):
+    """共享状态提交锁在限定时间内无法获取（接口不无限等待）。"""
+
+    error_code = "storage_busy"
 
 
 class ProbeTimeoutError(OrchestratorError):

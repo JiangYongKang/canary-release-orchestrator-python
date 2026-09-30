@@ -91,3 +91,6 @@ class ReleaseRecord:
     completed_batches: int = 0
     rollback_reason: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+    # 多实例乐观版本号（持久化由存储层维护）：每次状态变更 +1；
+    # 旧版数据加载时为 0。不参与存储层的状态一致性校验。
+    version: int = 0

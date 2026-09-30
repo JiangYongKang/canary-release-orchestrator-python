@@ -41,6 +41,8 @@ class ReleaseView(BaseModel):
     rollback_reason: str | None
     created_at: float
     updated_at: float
+    # 多实例乐观版本号：每次状态变更 +1；查询可据此发现状态已被其他实例推进
+    version: int = 0
     batches: list[BatchInfo]
 
 

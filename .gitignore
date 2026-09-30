@@ -10,4 +10,5 @@ build/
 
 # 本地运行时发布状态库及其隔离备份
 .release_state.json
+.release_state.json.locks/
 *.quarantine.*
