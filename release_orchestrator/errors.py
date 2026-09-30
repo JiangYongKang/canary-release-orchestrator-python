@@ -42,6 +42,22 @@ class AdvanceConflictError(OrchestratorError):
     error_code = "advance_conflict"
 
 
+class StaleVersionError(OrchestratorError):
+    """调用方持有陈旧进度：共享状态已被其他实例推进/完成/回滚。
+
+    本次调用未生效，调用方应重新查询最新状态后再决策。
+    响应体附带 current_version / expected_version / 当前状态。
+    """
+
+    error_code = "stale_version"
+
+
+class StateCommitBusyError(OrchestratorError):
+    """共享状态提交锁在限定时间内未获取（多实例高并发压力），本次未生效。"""
+
+    error_code = "state_commit_busy"
+
+
 class ProbeTimeoutError(OrchestratorError):
     """健康探测超时链路。"""
 

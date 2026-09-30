@@ -108,6 +108,7 @@ def record_to_dict(r: ReleaseRecord) -> dict[str, Any]:
         "completed_batches": r.completed_batches,
         "rollback_reason": r.rollback_reason,
         "events": list(r.events),
+        "version": r.version,
     }
 
 
@@ -207,9 +208,19 @@ def record_from_dict(d: Any) -> ReleaseRecord:
         completed_batches=int(d.get("completed_batches", 0)),
         rollback_reason=d.get("rollback_reason"),
         events=events,
+        version=_parse_version(rid, d),
     )
     _check_consistency(rec)
     return rec
+
+
+def _parse_version(rid: str, d: dict[str, Any]) -> int:
+    raw_version = d.get("version", 1)
+    if not isinstance(raw_version, int) or isinstance(raw_version, bool) or raw_version < 1:
+        raise IncompatibleStateError(
+            f"record({rid}): version 必须为 >=1 的整数，实际 {raw_version!r}"
+        )
+    return int(raw_version)
 
 
 def _check_consistency(r: ReleaseRecord) -> None:
@@ -247,7 +258,11 @@ class JsonFileStore:
             logger.info("state file not found at %s: starting empty", self.path)
             return LoadResult(records={}, quarantined=[])
         try:
-            raw = json.loads(self.path.read_text(encoding="utf-8"))
+            raw_text = self.path.read_text(encoding="utf-8")
+        except OSError as exc:
+            return self._quarantine_whole_file(f"状态文件无法读取: {exc}")
+        try:
+            raw = json.loads(raw_text)
         except (json.JSONDecodeError, OSError) as exc:
             return self._quarantine_whole_file(f"状态文件无法解析: {exc}")
         if not isinstance(raw, dict):
@@ -266,10 +281,38 @@ class JsonFileStore:
             return self._quarantine_whole_file(
                 f"schema_version={version} 过于陈旧且无可用迁移路径"
             )
+        try:
+            return self._parse_payload(raw)
+        except IncompatibleStateError as exc:
+            return self._quarantine_whole_file(str(exc))
 
+    def read_snapshot(self) -> LoadResult:
+        """只读最新盘上快照（不做任何隔离/改名副作用）。
+
+        供多实例在持有全局状态锁后重读共享状态：
+        - 文件不存在 -> 空快照；
+        - 文件损坏 / schema 不兼容 -> 抛 IncompatibleStateError，
+          调用方必须中止本次写，绝不能用内存快照覆盖（避免丢数据）。
+        """
+        if not self.path.exists():
+            return LoadResult(records={}, quarantined=[])
+        raw_text = self.path.read_text(encoding="utf-8")
+        raw = json.loads(raw_text)
+        if not isinstance(raw, dict):
+            raise IncompatibleStateError("状态文件根节点不是对象")
+        version = raw.get("schema_version")
+        if not isinstance(version, int) or isinstance(version, bool) or version != SCHEMA_VERSION:
+            raise IncompatibleStateError(
+                f"状态文件 schema_version={version!r} 与当前版本 {SCHEMA_VERSION} 不一致，"
+                "拒绝在其之上写入以防覆盖"
+            )
+        return self._parse_payload(raw)
+
+    def _parse_payload(self, raw: dict[str, Any]) -> LoadResult:
+        """解析 payload 中的记录与隔离清单；单条坏记录进入隔离而非中止整体。"""
         raw_records = raw.get("releases", {})
         if not isinstance(raw_records, dict):
-            return self._quarantine_whole_file("releases 节点不是对象")
+            raise IncompatibleStateError("releases 节点不是对象")
 
         records: dict[str, ReleaseRecord] = {}
         quarantined: list[QuarantinedRecord] = []

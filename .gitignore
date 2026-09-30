@@ -11,3 +11,7 @@ build/
 # 本地运行时发布状态库及其隔离备份
 .release_state.json
 *.quarantine.*
+
+# 多实例协作运行时：跨进程文件锁目录
+.locks/
+**/.locks/

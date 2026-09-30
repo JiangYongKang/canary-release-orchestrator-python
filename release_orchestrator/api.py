@@ -5,7 +5,9 @@
 - duplicate_release       409  重复提交（同名发布）
 - illegal_transition      409  非法状态转换
 - duplicate_advance       409  观察期未满/暂停态直接推进/重复中止
-- advance_conflict        409  并发推进冲突（本次调用未生效）
+- advance_conflict        409  并发冲突（本次调用未生效）
+- stale_version           409  调用方持有陈旧版本（本次未生效，响应含最新状态/版本）
+- state_commit_busy       503  共享状态提交锁暂忙（本次未生效，可安全重试）
 - manual_abort            409  对已人工中止发布执行操作
 - probe_timeout           504  探测超时（已自动回滚，响应体含回滚后状态）
 - consecutive_failure     502  连续健康失败达阈值（已自动回滚，响应体含回滚后状态）
@@ -28,14 +30,18 @@ from .errors import (
     OrchestratorError,
     ProbeTimeoutError,
     ReleaseNotFoundError,
+    StaleVersionError,
+    StateCommitBusyError,
 )
 from .models import GateAction, ReleasePlan
 from .schemas import (
     AbortRequest,
+    AdvanceRequest,
     AdvanceResponse,
     CreateReleaseRequest,
     EventView,
     ReleaseView,
+    ResumeRequest,
 )
 
 logger = logging.getLogger("release_orchestrator.api")
@@ -48,20 +54,26 @@ _STATUS_MAP = {
     IllegalTransitionError: 409,
     DuplicateAdvanceError: 409,
     AdvanceConflictError: 409,
+    StaleVersionError: 409,
     ManualAbortError: 409,
     ProbeTimeoutError: 504,
     ConsecutiveFailureError: 502,
+    StateCommitBusyError: 503,
 }
 
 
 def _error_response(exc: OrchestratorError) -> JSONResponse:
     status_code = _STATUS_MAP.get(type(exc), 400)
     body: dict = {"error_code": exc.error_code, "message": str(exc)}
-    # 超时/连续失败触发了自动回滚：把回滚后的一致状态一并返回，便于解释
+    # 超时/连续失败触发了自动回滚，或陈旧版本被拒：把当前一致状态一并返回，便于解释
     record = getattr(exc, "record", None)
     if record is not None:
-        body["action"] = GateAction.ROLLED_BACK.value
         body["release"] = _record_to_view(record)
+        if isinstance(exc, (ProbeTimeoutError, ConsecutiveFailureError)):
+            body["action"] = GateAction.ROLLED_BACK.value
+    if isinstance(exc, StaleVersionError):
+        body["expected_version"] = getattr(exc, "expected_version", None)
+        body["current_version"] = getattr(exc, "current_version", None)
     logger.warning("api reject: code=%s http=%d message=%s",
                    exc.error_code, status_code, exc)
     return JSONResponse(status_code=status_code, content=body)
@@ -83,6 +95,7 @@ def _record_to_view(record) -> dict:
         rollback_reason=record.rollback_reason,
         created_at=record.created_at,
         updated_at=record.updated_at,
+        version=record.version,
         batches=[
             {
                 "index": i + 1,
@@ -139,11 +152,14 @@ async def get_release(release_id: str, request: Request):
 
 
 @router.post("/releases/{release_id}/advance", response_model=AdvanceResponse)
-async def advance_release(release_id: str, request: Request):
+async def advance_release(release_id: str, request: Request, body: AdvanceRequest | None = None):
     orch = request.app.state.orchestrator
-    logger.info("api input POST /releases/%s/advance", release_id)
+    expected = body.expected_version if body is not None else None
+    logger.info(
+        "api input POST /releases/%s/advance expected_version=%s", release_id, expected
+    )
     try:
-        record, action = await orch.advance(release_id)
+        record, action = await orch.advance(release_id, expected_version=expected)
     except OrchestratorError as exc:
         return _error_response(exc)
     batch = record.batches[record.current_batch - 1] if record.current_batch > 0 else None
@@ -152,6 +168,7 @@ async def advance_release(release_id: str, request: Request):
         "current_batch": record.current_batch,
         "candidate_weight": record.current_weight,
         "active_version": record.active_version,
+        "version": record.version,
         "gate_attempts": batch.gate_attempts if batch else 0,
         "consecutive_failures": batch.consecutive_failures if batch else 0,
     }
@@ -160,19 +177,31 @@ async def advance_release(release_id: str, request: Request):
 
 @router.post("/releases/{release_id}/abort", response_model=ReleaseView)
 async def abort_release(release_id: str, body: AbortRequest, request: Request):
-    logger.info("api input POST /releases/%s/abort reason=%s", release_id, body.reason)
+    logger.info(
+        "api input POST /releases/%s/abort reason=%s expected_version=%s",
+        release_id, body.reason, body.expected_version,
+    )
     try:
-        record = await request.app.state.orchestrator.abort(release_id, body.reason)
+        record = await request.app.state.orchestrator.abort(
+            release_id, body.reason, expected_version=body.expected_version
+        )
     except OrchestratorError as exc:
         return _error_response(exc)
     return _record_to_view(record)
 
 
 @router.post("/releases/{release_id}/resume", response_model=ReleaseView)
-async def resume_release(release_id: str, request: Request):
-    logger.info("api input POST /releases/%s/resume", release_id)
+async def resume_release(
+    release_id: str, request: Request, body: ResumeRequest | None = None
+):
+    expected = body.expected_version if body is not None else None
+    logger.info(
+        "api input POST /releases/%s/resume expected_version=%s", release_id, expected
+    )
     try:
-        record = await request.app.state.orchestrator.resume(release_id)
+        record = await request.app.state.orchestrator.resume(
+            release_id, expected_version=expected
+        )
     except OrchestratorError as exc:
         return _error_response(exc)
     return _record_to_view(record)
@@ -189,10 +218,11 @@ async def get_events(release_id: str, request: Request):
 
 @router.get("/health")
 async def health(request: Request):
-    """服务健康自检：同时显式报告被隔离的不兼容历史数据。"""
+    """服务健康自检：实例标识 + 显式报告被隔离的不兼容历史数据。"""
     orch = request.app.state.orchestrator
     return {
         "status": "ok",
+        "instance_id": orch.instance_id,
         "quarantined_count": len(orch.quarantined),
         "quarantined": [
             {"release_id": q.release_id, "reason": q.reason, "quarantined_at": q.quarantined_at}

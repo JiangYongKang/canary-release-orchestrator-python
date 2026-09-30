@@ -7,7 +7,10 @@
 - 不访问任何外部服务、不需要真实凭据或付费资源；
 - 健康结果由本地**脚本化探测器**注入，默认探测器在未注入时始终判定健康；
 - 状态持久化在本地单个 JSON 文件中（默认 `./.release_state.json`，
-  可用环境变量 `RELEASE_STATE_FILE` 覆盖），写入为临时文件 + 原子替换。
+  可用环境变量 `RELEASE_STATE_FILE` 覆盖），写入为临时文件 + 原子替换；
+- **支持多实例协作**：多个本地服务进程（或同进程多线程）把 `RELEASE_STATE_FILE`
+  指向同一个文件即可共享发布状态，跨进程互斥、乐观版本与滚动重启安全
+  （见第 9 节）。
 
 > 兼容性：原有入口 `GET /` 保持不变，仍返回 `{"Hello": "World"}`。
 
@@ -17,7 +20,7 @@
 
 ```bash
 uv sync                                  # 安装依赖（含 pytest 开发依赖）
-uv run pytest -q                         # 运行全部本地测试（21 个）
+uv run pytest -q                         # 运行全部本地测试（34 个，含多实例）
 uv run uvicorn main:app --port 8000      # 启动服务
 ```
 
@@ -130,9 +133,9 @@ stateDiagram-v2
 | `POST /releases` | 创建发布（计划非法 → 422 `invalid_plan`；同名重复 → 409 `duplicate_release`） |
 | `GET /releases` | 列出全部发布 |
 | `GET /releases/{id}` | 查询单个发布 |
-| `POST /releases/{id}/advance` | 受控推进（返回 `action`：`started`/`advanced`/`completed`/`paused`） |
-| `POST /releases/{id}/abort` | 人工中止，body：`{"reason": "..."}` |
-| `POST /releases/{id}/resume` | 从暂停恢复（观察期重新计时） |
+| `POST /releases/{id}/advance` | 受控推进（返回 `action`：`started`/`advanced`/`completed`/`paused`）；body 可选 `{"expected_version": N}` |
+| `POST /releases/{id}/abort` | 人工中止，body：`{"reason": "...", "expected_version": N?}` |
+| `POST /releases/{id}/resume` | 从暂停恢复（观察期重新计时）；body 可选 `{"expected_version": N}` |
 | `GET /releases/{id}/events` | 审计事件链 |
 | `GET /health` | 服务自检，并列出被隔离的不兼容历史数据 |
 
@@ -146,18 +149,26 @@ stateDiagram-v2
 | `illegal_transition` | 409 | 终态/非法状态转换 |
 | `duplicate_advance` | 409 | 观察期未满、暂停态直接推进、未达阈值的不健康、重复中止 |
 | `advance_conflict` | 409 | 同一发布已有在途操作（并发冲突，本次未生效） |
+| `stale_version` | 409 | 调用方携带的 `expected_version` 已陈旧，本次未生效（响应含 `current_version` 与最新发布状态） |
+| `state_commit_busy` | 503 | 共享状态提交锁在限定时间内未获取（本次未生效，可安全重试） |
 | `manual_abort` | 409 | 对已人工中止的发布执行推进/恢复 |
 | `consecutive_failure` | 502 | 连续健康失败达阈值（已自动回滚，响应含回滚状态） |
 | `probe_timeout` | 504 | 健康探测超时（已自动回滚，响应含回滚状态） |
 
+发布视图与 advance 响应新增 `version` 字段（从 1 开始，每次生效变更单调 +1，
+旧数据无该字段时按 1 处理）；`POST /advance`、`/abort`、`/resume` 的请求体
+都可选携带 `expected_version`（不传时保持原有按当前阶段判定的行为）。
+事件结构新增顶层 `instance_id`（执行变更的实例标识，旧事件无该字段时原样保留）。
+
 ---
 
-## 5. 并发安全
+## 5. 并发安全（进程内）
 
-- 每个发布持有独立的 `asyncio.Lock` 与"在途操作"标志（`orchestrator.py`）；
-  `advance` / `abort` / `resume` 进入临界区前做非占用检查，已有在途操作立即返回
-  `advance_conflict`，**同一发布的并发推进只有一个有效结果**，不重复切权重、不丢状态；
+- 每个发布持有独立的 `asyncio.Lock`；`advance` / `abort` / `resume` 进入临界区前
+  做非占用检查，已有在途操作立即返回 `advance_conflict`，**同一事件循环内对同一发布
+  的并发调用只有一个有效结果**，不重复切权重、不丢状态；
 - 存储写入串行化（`threading.Lock`）并采用 `os.replace` 原子替换，避免半写文件；
+- 跨进程/多实例协作规则见第 9 节。
 - 测试 `tests/test_concurrency_recovery.py` 与 `tests/test_api_compat.py`
   分别在编排器层（`asyncio.gather`）与 HTTP 层（多线程）验证"单赢家"语义。
 
@@ -165,9 +176,12 @@ stateDiagram-v2
 
 - 每次状态变更后立即落盘；重启时从文件恢复：
   - 以每批次 `completed` 标记为准，**已完成批次绝不重复执行**；
-  - `current_batch` / 当前权重 / 活动版本 / 连续失败计数 / 暂停态全部恢复；
+  - `current_batch` / 当前权重 / 活动版本 / 连续失败计数 / 暂停态 / `version` 全部恢复；
   - 回滚只可能发生一次（事件链中 `rollback` 唯一）。
-- 文件结构带 `schema_version`（当前 1）。加载策略：
+- 记录带单调递增 `version`（创建后为 2）：每次生效变更（含陈旧拒绝事件）+1，
+  供多实例做乐观并发校验（见第 9 节）。
+- 文件结构带 `schema_version`（当前 1）。**本次新增字段全部是加性变更，
+  旧版本写出的状态文件无需迁移即可继续使用**。加载策略：
   - **单条记录**不兼容（字段缺失、类型错误、权重与进度自相矛盾、未知状态等）
     → 移入 `quarantine` 并随状态文件持久化、写 WARNING 日志，其余记录正常加载；
   - **整个文件**损坏、根结构非法或 schema 版本更新无法兼容
@@ -176,12 +190,88 @@ stateDiagram-v2
 
 ---
 
-## 7. 本地验证
+## 7. 多实例部署：使用边界、冲突与恢复规则
+
+多个本地服务进程（演示 / CI 常见）只需把 `RELEASE_STATE_FILE` 指向**同一份**
+状态文件即可组成共享同一发布状态的集群：
+
+```bash
+RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-1 \
+  uv run uvicorn main:app --port 8001 &
+RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
+  uv run uvicorn main:app --port 8002 &
+```
+
+`RELEASE_INSTANCE_ID` 可选：固定实例标识（出现在审计事件与 `GET /health` 中，
+便于区分是哪个实例执行了变更）；不指定时每进程自动生成。
+
+### 7.1 互斥与单赢家
+
+- 每个发布在 `<状态文件目录>/.locks/` 下有一把跨进程文件锁
+  （`release-<id>.lock`，基于 `fcntl.flock`，由内核在持锁进程退出时自动释放）。
+  `advance` / `resume` / `abort` **非阻塞抢锁**：同一发布被多个实例同时操作时，
+  恰好一个调用真正执行，其余立即得到 `409 advance_conflict`（本次未生效）。
+  因此同一次流量切换不会执行两遍，门禁探测不会对同一批次重复计数。
+- 另有一把毫秒级全局提交锁 `global.state.lock`，只在"重读盘上最新快照 →
+  变更 → 原子落盘"期间短暂持有。**不同发布各有独立的发布锁，互不排队堵住**。
+- 若全局提交锁在限定时限内（默认 5s）未获取，返回 `503 state_commit_busy`：
+  本次未生效、未写任何状态，调用方可安全重试。
+
+### 7.2 总是以共享状态最新进度为准（防陈旧覆盖）
+
+- 实例内存中的发布记录只是**查询缓存**：任何一次变更都在锁内重新读取盘上的
+  最新快照后再计算。运行很久的实例、暂停后继续的实例、滚动重启回来的实例，
+  都**不可能拿旧进度覆盖他人已推进/完成/回滚的结果**；终态不会被写回进行中、
+  批次不会重复完成。
+- 查询接口（`GET /releases`、`GET /releases/{id}`、`/events`、`/health`）
+  同样每次重读最新快照，总是反映其他实例刚提交的结果。
+
+### 7.3 乐观版本与"未生效"的可区分结果
+
+- 发布视图含 `version`，每次生效变更（含被记录的拒绝）单调 +1。
+- 调用方可在请求体携带 `expected_version`（推进/中止/恢复均支持，可选）。
+  当共享状态版本已不一致：
+  - 返回 `409 stale_version`，响应体带 `expected_version`、`current_version`
+    与最新发布完整视图，调用方据此明确知道"这次没生效"，重新查询后再决策；
+  - 事件链追加一条 `operation_rejected`（`reason=stale_version`，含
+    `current_status/current_batch/decision`），**拒绝原因在查询与事件记录里都
+    看得见**，版本也前进一格。
+- 不带 `expected_version` 时保持原有按当前阶段判定的行为：对终态推进仍返回
+  `illegal_transition`、对已中止发布操作返回 `manual_abort`，同样绝不回退状态。
+- `409 advance_conflict`（锁竞争，毫秒级重试即可）不写事件、不动版本；
+  观察期未满的 `duplicate_advance` 会记录 `advance_rejected` 事件。
+
+推荐调用姿势：先 `GET` 拿到 `version` → 操作时回传 `expected_version`；
+收到 `advance_conflict` / `state_commit_busy` 可直接重试；收到 `stale_version`
+则以响应里的最新状态重新决策。
+
+### 7.4 使用边界（本地/CI 语义，不承诺的场景）
+
+- 锁基于 POSIX `fcntl.flock`：适用于 Linux/macOS 本地磁盘与 CI，
+  **不支持 Windows**，也不保证 NFS/网络盘等非常规文件系统上的锁语义；
+- 目标是"本机多进程共享一个文件"，不是分布式数据库：不做跨主机锁租约、
+  不做跨实例健康探测协调（探测器仍是各进程本地注入，多实例时应注入行为一致的
+  判定来源）；
+- 整文件原子替换保证读端永远看到完整 JSON；状态文件被外部进程并发改写到
+  schema 不一致时，实例会拒绝在其上写入（宁可本次调用失败也不覆盖数据）。
+
+### 7.5 兼容范围
+
+- 旧版本写出的状态文件（无 `version`、事件无 `instance_id`、`schema_version=1`）
+  **原样可用**：记录按 `version=1` 加载，旧事件保持不变，之后正常续跑；
+- 单条不兼容记录继续移入 `quarantine` 并在 `/health` 暴露；整文件损坏继续
+  备份为 `.quarantine.<时间戳>` 后空库启动（见第 6 节），不静默丢数据。
+
+---
+
+## 8. 本地验证
 
 ```bash
 # 全部测试：正常推进 / 重复请求 / 并发推进 / 重启恢复 /
 # 健康失败 / 连续失败回滚 / 探测超时回滚 / 暂停恢复 / 人工中止 /
-# 非法状态转换 / 脏数据隔离 / 入口兼容
+# 非法状态转换 / 脏数据隔离 / 入口兼容 /
+# 多进程同发布单赢家 / 陈旧实例拒绝 / 不同发布并行 /
+# 滚动重启一致性 / 高压并发状态完整性 / 真实双 uvicorn 进程 HTTP 协作
 uv run pytest -q
 ```
 
@@ -190,21 +280,33 @@ uv run pytest -q
 - **输入**：每次 API 调用 / advance 的状态、批次、权重、活动版本；
 - **状态变化**：如 `PENDING -> IN_PROGRESS batch=1 weight=10`；
 - **判定依据**：探测判定 `verdict / reason / metrics`、观察期 `elapsed vs required`、
-  连续失败计数 `failures/threshold`、每个事件的 `decision` 文本。
+  连续失败计数 `failures/threshold`、每个事件的 `decision` 文本；
+- **多实例判定**：`conflict rejected ... flock held by another instance`、
+  `stale rejected ... expected=vN current=vM`、`committed ... version=vK`。
 
-也可以按"快速开始"用真实 uvicorn + curl 验证（包括 kill 进程后重启续跑）。
+多实例相关测试：
 
-## 8. 代码结构
+| 测试文件 | 覆盖 |
+| --- | --- |
+| `tests/test_multi_instance.py` | 多进程同发布推进/中止单赢家、陈旧 advance/abort/resume 拒绝、回滚终态防复活、暂停实例防覆盖、不同发布并行、滚动重启接力、高压并发状态完整性、同进程多实例版本单调 |
+| `tests/test_multi_instance_http.py` | 两个真实 uvicorn 进程共享状态文件：跨进程单赢家、`stale_version` 409、事件共享、新进程重启接力 |
+| `tests/_multi_process_worker.py` | 多进程测试的子进程入口（独立文件以兼容 spawn/forkserver） |
+
+也可以手动起两个 uvicorn（见第 7 节开头），用 curl 分别打两个端口验证，
+包括 kill 掉一个进程后用新进程接力。
+
+## 9. 代码结构
 
 ```
 main.py                              # FastAPI 入口（保持 GET / 兼容），挂载编排器单例
 release_orchestrator/
-  models.py                          # 状态枚举、计划/批次/记录等领域模型
+  models.py                          # 状态枚举、计划/批次/记录（含乐观 version）等领域模型
   errors.py                          # 可区分异常类型（每种拒绝/失败链路一个类）
   health.py                          # 探测协议、脚本化探测器、注册表、默认健康探测器
-  storage.py                         # JSON 原子持久化、schema 校验、脏数据隔离
-  orchestrator.py                    # 推进状态机、门禁、回滚/中止/恢复、并发控制
-  schemas.py                         # HTTP 请求/响应模型
+  locking.py                         # fcntl.flock 跨进程文件锁（每发布锁 + 全局提交锁）
+  storage.py                         # JSON 原子持久化、schema 校验、脏数据隔离、锁内重读快照
+  orchestrator.py                    # 推进状态机、门禁、回滚/中止/恢复、双层锁与版本协作
+  schemas.py                         # HTTP 请求/响应模型（expected_version 可选）
   api.py                             # REST 路由与异常->错误码映射
-tests/                               # 21 个本地测试 + conftest（可控时钟/临时状态库）
+tests/                               # 34 个本地测试 + conftest（可控时钟/临时状态库）
 ```

@@ -42,6 +42,18 @@ class ReleaseView(BaseModel):
     created_at: float
     updated_at: float
     batches: list[BatchInfo]
+    # 乐观版本号：每次生效变更（含陈旧拒绝事件）单调 +1。
+    # 多实例调用方可在推进/恢复/中止时回传以检测陈旧进度。
+    version: int = 1
+
+
+class AdvanceRequest(BaseModel):
+    """推进请求体（可选）：回传上次查询到的 version 做乐观并发校验。
+
+    不传时保持原语义：仅按共享状态当前阶段判定。
+    """
+
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class AdvanceResponse(BaseModel):
@@ -52,6 +64,11 @@ class AdvanceResponse(BaseModel):
 
 class AbortRequest(BaseModel):
     reason: str = ""
+    expected_version: int | None = Field(default=None, ge=1)
+
+
+class ResumeRequest(BaseModel):
+    expected_version: int | None = Field(default=None, ge=1)
 
 
 class EventView(BaseModel):

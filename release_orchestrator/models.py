@@ -91,3 +91,7 @@ class ReleaseRecord:
     completed_batches: int = 0
     rollback_reason: str | None = None
     events: list[dict[str, Any]] = field(default_factory=list)
+    # 乐观版本号：每次状态变更（含被接受的拒绝事件）单调 +1。
+    # 多实例协作时用于判定调用方手里的进度是否已陈旧；
+    # 旧数据没有该字段，加载时按 1 处理（加性兼容）。
+    version: int = 1
