@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import subprocess
+import time
 
 import pytest
 import sys
@@ -97,7 +98,12 @@ def load_final(state_path: Path, rid: str) -> object:
 # --------------------------------------------------------------------------- #
 
 def test_multi_process_advance_single_winner(state_path: Path):
-    """4 个进程同时对同一发布连续推进：每次切换只发生一次，其余调用明确未生效。"""
+    """4 个进程同时对同一发布连续推进：每次切换只发生一次，其余调用明确未生效。
+
+    非阻塞抢锁下，16 次调用中能有几次抢到锁取决于进程调度（生效次数
+    不少于 1 即可），因此竞速阶段按不变量判定；随后用一个"退避重试直到
+    生效"的实例确定性收尾，再校验终态一致性。
+    """
     rid = make_release(state_path)
     n_procs, rounds = 4, 4
     results = run_instances([
@@ -109,15 +115,28 @@ def test_multi_process_advance_single_winner(state_path: Path):
     flat = [c for r in results for c in r["results"]]
     oks = [c for c in flat if "ok" in c]
     rejects = [c for c in flat if "err" in c]
-    actions = [c["ok"] for c in oks]
 
-    # 3 批权重：started + advanced + advanced + completed，共 4 次生效，且顺序正确
-    assert actions == ["started", "advanced", "advanced", "completed"], actions
-    # 其余 12 次全部明确拒绝（冲突 / 观察期未满 / 终态非法转换），没有"半生效"
-    assert len(rejects) == 12
+    # 每次调用都有明确结果：要么生效，要么以可区分错误码未生效（无"半生效"）
+    assert len(oks) + len(rejects) == n_procs * rounds
     assert {c["err"] for c in rejects} <= {
         "advance_conflict", "duplicate_advance", "illegal_transition"
     }
+    # 生效调用按 version 排序（即真实时序）必须是规范序列的无重复前缀：
+    # 同一次流量切换不会执行两遍，也不会跳批
+    canonical = ["started", "advanced", "advanced", "completed"]
+    oks_by_version = sorted(oks, key=lambda c: c["version"])
+    effective = [c["ok"] for c in oks_by_version]
+    assert effective == canonical[: len(effective)], effective
+    assert [c["version"] for c in oks_by_version] == list(range(3, 3 + len(effective)))
+
+    # 确定性收尾：模拟真实调用方对"未生效"结果退避重试，直到发布完成
+    drain = run_instances([
+        cfg("drain", state_path, rid,
+            [{"op": "advance", "retry_until_effective": True} for _ in range(4)],
+            fake_clock=False)
+    ])
+    drain_flat = drain[0]["results"]
+    assert all("ok" in c or c["err"] == "illegal_transition" for c in drain_flat)
 
     final = load_final(state_path, rid)
     assert final.status is ReleaseStatus.COMPLETED
@@ -128,9 +147,18 @@ def test_multi_process_advance_single_winner(state_path: Path):
     assert sum(1 for e in final.events if e["type"] == "traffic_switched") == 3
     assert sum(1 for e in final.events if e["type"] == "release_completed") == 1
     assert [e["seq"] for e in final.events] == list(range(1, len(final.events) + 1))
-    # create + 4 次生效推进 -> version v6
-    assert final.version == 6
-    print(f"[判定] 生效 {len(oks)} 次（{actions}），拒绝 {len(rejects)} 次，"
+    # create + 4 次生效推进 -> v6；此后每次撞终态的拒绝都会留
+    # operation_rejected 事件并让 version 前进（但状态/权重/批次不变）；
+    # 抢锁冲突（advance_conflict）不留痕、不动 version
+    all_calls = flat + drain_flat
+    n_terminal_rejects = sum(1 for c in all_calls if c.get("err") == "illegal_transition")
+    assert final.version == 6 + n_terminal_rejects
+    rej_events = [e for e in final.events if e["type"] == "operation_rejected"]
+    assert len(rej_events) == n_terminal_rejects
+    assert all(e["detail"]["reason"] == "terminal_status" for e in rej_events)
+    assert all(e["detail"]["current_status"] == "completed" for e in rej_events)
+    print(f"[判定] 竞速生效 {len(effective)} 次（{effective}），"
+          f"拒绝 {len(all_calls) - 4} 次（终态拒绝留痕 {n_terminal_rejects} 次），"
           f"最终 version=v{final.version}")
 
 
@@ -267,6 +295,49 @@ def test_stale_paused_instance_cannot_overwrite(state_path: Path):
 # --------------------------------------------------------------------------- #
 # 3. 不同发布并行不互相阻塞
 # --------------------------------------------------------------------------- #
+
+def test_slow_probe_does_not_block_other_release_across_processes(state_path, tmp_path):
+    """一条发布的探测卡住 3s 时，另一条发布的推进在合理时间内生效。
+
+    复现线上现象：慢探测若占用全局提交锁，无关发布的推进会被拖着等满
+    commit_timeout 并以 state_commit_busy 失败；修复后探测只占用本发布的
+    发布锁，无关发布直接成功。
+    """
+    rid_slow = make_release(state_path, weights=(100,), name="slow-svc")
+    rid_fast = make_release(state_path, weights=(100,), name="fast-svc")
+    entered = tmp_path / "slow_probe_entered"
+
+    # P1：启动 slow-svc 后再次推进 -> 进入门禁，探测卡住 3s
+    p1 = _spawn(cfg("slow-inst", state_path, rid_slow,
+                    [{"op": "advance"}, {"op": "advance"}],
+                    fake_clock=False,
+                    probe_delay_seconds=3.0,
+                    probe_entered_file=str(entered)))
+    # 等 P1 确实进入探测（即旧实现中"全局提交锁被慢探测占用"的窗口）
+    deadline = time.monotonic() + 15
+    while not entered.exists() and time.monotonic() < deadline:
+        time.sleep(0.02)
+    assert entered.exists(), "慢探测未进入"
+
+    # P2：对完全无关的 fast-svc 连续推进到完成；commit_timeout 调小以放大回归
+    t0 = time.monotonic()
+    res = run_instances([cfg("fast-inst", state_path, rid_fast,
+                             [{"op": "advance"}, {"op": "advance"}],
+                             fake_clock=False, commit_timeout=1.0)])
+    elapsed = time.monotonic() - t0
+
+    out, err = p1.communicate(timeout=30)
+    assert p1.returncode == 0, err
+    slow_results = json.loads(out)["results"]
+
+    fast = res[0]["results"]
+    assert [c["ok"] for c in fast] == ["started", "completed"], fast
+    assert elapsed < 2.5, f"无关发布被慢探测拖住: {elapsed:.1f}s"
+    # 慢探测放行后，slow-svc 自己也正常完成
+    assert [c["ok"] for c in slow_results] == ["started", "completed"], slow_results
+    print(f"[判定] 慢探测卡住 3s 期间，无关发布推进到 completed 耗时 "
+          f"{elapsed:.2f}s（commit_timeout=1.0s 也未触发 state_commit_busy）")
+
 
 def test_different_releases_progress_in_parallel(state_path: Path):
     """30 条不同发布分两波并行推进：全部精确 started/completed 一次，无跨发布冲突。"""

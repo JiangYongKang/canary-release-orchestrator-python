@@ -20,7 +20,7 @@
 
 ```bash
 uv sync                                  # 安装依赖（含 pytest 开发依赖）
-uv run pytest -q                         # 运行全部本地测试（34 个，含多实例）
+uv run pytest -q                         # 运行全部本地测试（43 个，含多实例）
 uv run uvicorn main:app --port 8000      # 启动服务
 ```
 
@@ -160,6 +160,12 @@ stateDiagram-v2
 都可选携带 `expected_version`（不传时保持原有按当前阶段判定的行为）。
 事件结构新增顶层 `instance_id`（执行变更的实例标识，旧事件无该字段时原样保留）。
 
+被拒绝的调用（`stale_version`，以及终态/暂停态上的 `illegal_transition` /
+`manual_abort` / `duplicate_advance`）会在事件链留下 `operation_rejected`
+事件（含 `reason`、当时 `current_status/current_batch/current_weight` 与
+`decision` 判定依据）并让 `version` 前进，响应体也附带最新发布视图；
+`advance_conflict` / `state_commit_busy` 属于锁竞争，不留痕、不动版本。
+
 ---
 
 ## 5. 并发安全（进程内）
@@ -212,12 +218,28 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
   `advance` / `resume` / `abort` **非阻塞抢锁**：同一发布被多个实例同时操作时，
   恰好一个调用真正执行，其余立即得到 `409 advance_conflict`（本次未生效）。
   因此同一次流量切换不会执行两遍，门禁探测不会对同一批次重复计数。
+- **健康门禁探测在全局提交锁之外执行**（此时只持有该发布自己的发布锁）：
+  某条发布的探测再慢、甚至卡住，也只占用它自己的发布锁——
+  **不相关发布的推进/恢复/中止照常立即生效**，不会被拖着等待，
+  更不会因此得到 `state_commit_busy`。
 - 另有一把毫秒级全局提交锁 `global.state.lock`，只在"重读盘上最新快照 →
-  变更 → 原子落盘"期间短暂持有。**不同发布各有独立的发布锁，互不排队堵住**。
+  应用已完成的探测结果 → 原子落盘"期间短暂持有。**不同发布各有独立的发布锁，
+  互不排队堵住**：不同发布的操作只在这毫秒级的提交阶段可能短暂相遇。
 - 若全局提交锁在限定时限内（默认 5s）未获取，返回 `503 state_commit_busy`：
-  本次未生效、未写任何状态，调用方可安全重试。
+  本次未生效、未写任何状态，调用方可安全重试。该等待是有上限的，
+  且**只影响当前这一条调用**，不连累其他发布，接口也不会长时间卡住。
 
-### 7.2 总是以共享状态最新进度为准（防陈旧覆盖）
+### 7.2 不同发布互不阻塞的使用边界
+
+| 场景 | 行为 |
+| --- | --- |
+| 发布 A 探测慢/卡住，操作无关发布 B | **直接成功**：B 的 advance/resume/abort 只等毫秒级提交锁，立即生效 |
+| 同一发布被多实例同时 advance/resume/abort | 恰好一个生效，其余**立即** `409 advance_conflict`（非阻塞，不排队） |
+| 多发布同时落盘的瞬时提交竞争 | 在全局提交锁上**短暂等待**（毫秒级，上限 `commit_timeout`），通常调用方无感 |
+| 提交锁等待超过 `commit_timeout`（极端压力） | 当前调用 `503 state_commit_busy`，未写任何状态，可安全重试；其他发布不受影响 |
+| 对终态/暂停态发布的推进/恢复/中止 | **明确拒绝**（`illegal_transition`/`manual_abort`/`duplicate_advance`）并留痕（见 7.3），状态不被改动 |
+
+### 7.3 总是以共享状态最新进度为准（防陈旧覆盖）
 
 - 实例内存中的发布记录只是**查询缓存**：任何一次变更都在锁内重新读取盘上的
   最新快照后再计算。运行很久的实例、暂停后继续的实例、滚动重启回来的实例，
@@ -226,7 +248,7 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
 - 查询接口（`GET /releases`、`GET /releases/{id}`、`/events`、`/health`）
   同样每次重读最新快照，总是反映其他实例刚提交的结果。
 
-### 7.3 乐观版本与"未生效"的可区分结果
+### 7.4 乐观版本与"未生效"的可区分结果
 
 - 发布视图含 `version`，每次生效变更（含被记录的拒绝）单调 +1。
 - 调用方可在请求体携带 `expected_version`（推进/中止/恢复均支持，可选）。
@@ -236,8 +258,14 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
   - 事件链追加一条 `operation_rejected`（`reason=stale_version`，含
     `current_status/current_batch/decision`），**拒绝原因在查询与事件记录里都
     看得见**，版本也前进一格。
-- 不带 `expected_version` 时保持原有按当前阶段判定的行为：对终态推进仍返回
-  `illegal_transition`、对已中止发布操作返回 `manual_abort`，同样绝不回退状态。
+- **不带 `expected_version` 时，对终态（completed/rolled_back/aborted）或
+  暂停等待中发布的推进/恢复/中止同样留痕**：调用仍按原有错误码拒绝
+  （`illegal_transition` / `manual_abort` / `duplicate_advance`），
+  事件链追加 `operation_rejected`（`reason` 为 `terminal_status` /
+  `already_aborted` / `paused_waiting_resume` / `not_paused`，含当时状态、
+  批次与判定依据），`version` 相应前进——但**拒绝本身绝不改动发布的实际
+  状态、当前权重与已完成批次**，事后排查能在查询结果与事件记录里看到
+  "这次调用被拒绝过、为什么"。
 - `409 advance_conflict`（锁竞争，毫秒级重试即可）不写事件、不动版本；
   观察期未满的 `duplicate_advance` 会记录 `advance_rejected` 事件。
 
@@ -245,7 +273,7 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
 收到 `advance_conflict` / `state_commit_busy` 可直接重试；收到 `stale_version`
 则以响应里的最新状态重新决策。
 
-### 7.4 使用边界（本地/CI 语义，不承诺的场景）
+### 7.5 使用边界（本地/CI 语义，不承诺的场景）
 
 - 锁基于 POSIX `fcntl.flock`：适用于 Linux/macOS 本地磁盘与 CI，
   **不支持 Windows**，也不保证 NFS/网络盘等非常规文件系统上的锁语义；
@@ -255,7 +283,7 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
 - 整文件原子替换保证读端永远看到完整 JSON；状态文件被外部进程并发改写到
   schema 不一致时，实例会拒绝在其上写入（宁可本次调用失败也不覆盖数据）。
 
-### 7.5 兼容范围
+### 7.6 兼容范围
 
 - 旧版本写出的状态文件（无 `version`、事件无 `instance_id`、`schema_version=1`）
   **原样可用**：记录按 `version=1` 加载，旧事件保持不变，之后正常续跑；
@@ -271,6 +299,7 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
 # 健康失败 / 连续失败回滚 / 探测超时回滚 / 暂停恢复 / 人工中止 /
 # 非法状态转换 / 脏数据隔离 / 入口兼容 /
 # 多进程同发布单赢家 / 陈旧实例拒绝 / 不同发布并行 /
+# 慢探测下无关发布不被拖住（进程内 + 多进程）/ 终态与暂停态拒绝留痕 /
 # 滚动重启一致性 / 高压并发状态完整性 / 真实双 uvicorn 进程 HTTP 协作
 uv run pytest -q
 ```
@@ -282,15 +311,18 @@ uv run pytest -q
 - **判定依据**：探测判定 `verdict / reason / metrics`、观察期 `elapsed vs required`、
   连续失败计数 `failures/threshold`、每个事件的 `decision` 文本；
 - **多实例判定**：`conflict rejected ... flock held by another instance`、
-  `stale rejected ... expected=vN current=vM`、`committed ... version=vK`。
+  `stale rejected ... expected=vN current=vM`、`committed ... version=vK`、
+  `op rejected ... reason=terminal_status/already_aborted/...`（拒绝留痕）。
 
 多实例相关测试：
 
 | 测试文件 | 覆盖 |
 | --- | --- |
-| `tests/test_multi_instance.py` | 多进程同发布推进/中止单赢家、陈旧 advance/abort/resume 拒绝、回滚终态防复活、暂停实例防覆盖、不同发布并行、滚动重启接力、高压并发状态完整性、同进程多实例版本单调 |
+| `tests/test_multi_instance.py` | 多进程同发布推进/中止单赢家、陈旧 advance/abort/resume 拒绝、回滚终态防复活、暂停实例防覆盖、不同发布并行、**慢探测卡住时无关发布照常完成（多进程）**、滚动重启接力、高压并发状态完整性、同进程多实例版本单调 |
+| `tests/test_cross_release_isolation.py` | 进程内多线程：一条发布探测卡住时，无关发布的推进/中止/恢复在合理时间内生效（不报 `state_commit_busy`）；同发布并发仍单赢家、探测不重复 |
+| `tests/test_rejection_trace.py` | 终态（completed/rolled_back/aborted）与暂停态、未带 `expected_version` 的拒绝调用：`operation_rejected` 事件留痕、`version` 前进、状态/权重/批次不变 |
 | `tests/test_multi_instance_http.py` | 两个真实 uvicorn 进程共享状态文件：跨进程单赢家、`stale_version` 409、事件共享、新进程重启接力 |
-| `tests/_multi_process_worker.py` | 多进程测试的子进程入口（独立文件以兼容 spawn/forkserver） |
+| `tests/_multi_process_worker.py` | 多进程测试的子进程入口（独立文件以兼容 spawn/forkserver；支持注入慢探测） |
 
 也可以手动起两个 uvicorn（见第 7 节开头），用 curl 分别打两个端口验证，
 包括 kill 掉一个进程后用新进程接力。
@@ -308,5 +340,5 @@ release_orchestrator/
   orchestrator.py                    # 推进状态机、门禁、回滚/中止/恢复、双层锁与版本协作
   schemas.py                         # HTTP 请求/响应模型（expected_version 可选）
   api.py                             # REST 路由与异常->错误码映射
-tests/                               # 34 个本地测试 + conftest（可控时钟/临时状态库）
+tests/                               # 43 个本地测试 + conftest（可控时钟/临时状态库）
 ```

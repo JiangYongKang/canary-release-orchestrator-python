@@ -10,6 +10,7 @@ import asyncio
 import json
 import sys
 import time
+from pathlib import Path
 
 sys.path.insert(0, ".")
 
@@ -23,6 +24,24 @@ from release_orchestrator.health import (  # noqa: E402
 )
 from release_orchestrator.orchestrator import ReleaseOrchestrator  # noqa: E402
 from release_orchestrator.models import ReleasePlan  # noqa: E402
+
+
+class _SlowHealthyProbe:
+    """探测耗时数秒的探测器：模拟依赖内部指标接口的慢探测。
+
+    进入探测时触碰 probe_entered_file（供驱动进程确认"已卡在探测里"），
+    然后 sleep 指定时长后判定健康。
+    """
+
+    def __init__(self, delay: float, entered_file: str | None) -> None:
+        self._delay = delay
+        self._entered_file = entered_file
+
+    def probe(self, release_id, candidate, weight):
+        if self._entered_file:
+            Path(self._entered_file).touch()
+        time.sleep(self._delay)
+        return HealthProbeResult(HealthVerdict.HEALTHY, "slow but healthy")
 
 
 def _orchestrator(cfg: dict, iid: str) -> ReleaseOrchestrator:
@@ -61,6 +80,14 @@ def _run(cfg: dict) -> dict:
     rid = cfg["release_id"]
     # 每个进程都注册永远健康的探测器（多实例下探测器是各进程本地注入的）
     orch.probes.register(rid, AlwaysHealthyProbe())
+    if cfg.get("probe_delay_seconds"):
+        # 慢探测：模拟门禁依赖的内部指标接口耗时数秒的场景
+        orch.probes.register(
+            rid, _SlowHealthyProbe(
+                float(cfg["probe_delay_seconds"]),
+                cfg.get("probe_entered_file"),
+            )
+        )
     if cfg.get("scripted"):
         orch.probes.register(
             rid, ScriptedHealthProbe(

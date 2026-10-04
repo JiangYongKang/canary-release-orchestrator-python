@@ -6,9 +6,14 @@
   基于 fcntl.flock，见 locking.py）：同一发布的 advance / resume / abort
   跨进程、跨线程互斥；抢锁为**非阻塞**，抢不到立即返回 ``advance_conflict``，
   本次调用不生效——同一次流量切换不会执行两遍。
+- 健康门禁探测在**全局提交锁之外**执行（此时只持有该发布自己的发布锁）：
+  某条发布的探测再慢、甚至卡住，也只占用它自己的发布锁，绝不阻塞
+  不相关发布的推进/恢复/中止。
 - 另有一把全局状态锁（``global.state.lock``），只在毫秒级的
-  "读盘上最新快照 -> 变更 -> 原子落盘"提交阶段短暂持有；不同发布各自有
-  独立的发布锁，互不排队。
+  "读盘上最新快照 -> 应用已完成的探测结果 -> 原子落盘"提交阶段短暂持有；
+  不同发布各自有独立的发布锁，互不排队。提交锁等待有上限
+  （``commit_timeout``），超时只让当前这一条调用以 ``state_commit_busy``
+  未生效返回，不连累无关发布，接口也不会长时间卡住。
 - 任何变更都在全局锁内以**共享状态里的最新记录**为基准，实例内存中的
   ReleaseRecord 仅作查询缓存：运行很久 / 暂停后继续 / 重启回来的实例都
   不可能用旧进度覆盖他人的新结果，终态（completed/rolled_back/aborted）
@@ -16,6 +21,10 @@
 - 每次生效的变更使记录 ``version`` 单调 +1。调用方可传 ``expected_version``
   做乐观并发校验：与共享状态不一致时返回 ``stale_version``，调用未生效，
   并留下 ``operation_rejected`` 事件，查询结果与事件链都能看到拒绝原因。
+- 对终态（completed/rolled_back/aborted）或暂停等待中的发布再次推进/恢复/
+  中止时，即使调用方没有携带 ``expected_version`，被拒绝的调用同样写入
+  ``operation_rejected`` 事件（含当时状态、批次与判定依据）并让 ``version``
+  前进——但拒绝本身绝不改动状态、当前权重与已完成批次。
 - 持锁进程异常退出时锁由内核自动释放；状态文件仍是临时文件 + os.replace
   原子替换，读端永远读到完整文件。
 
@@ -49,6 +58,7 @@ from .errors import (
     IllegalTransitionError,
     IncompatibleStateError,
     ManualAbortError,
+    OrchestratorError,
     ProbeTimeoutError,
     ReleaseNotFoundError,
     StaleVersionError,
@@ -102,6 +112,22 @@ class _Txn:
     def persist(self) -> None:
         """状态机在实际产生变更后调用；提交器据此在结束时落盘一次。"""
         self.dirty = True
+
+
+@dataclass
+class _PreparedGate:
+    """全局提交锁之外完成的门禁探测结果。
+
+    探测可能耗时数秒（依赖内部指标接口），因此放在只持有发布锁的阶段执行；
+    提交阶段仅应用这里的结果，不在全局锁内发起任何慢速调用。
+    """
+
+    result: HealthProbeResult | None = None
+    timeout: ProbeTimeoutError | None = None
+
+    @property
+    def probed(self) -> bool:
+        return self.result is not None or self.timeout is not None
 
 
 class ReleaseOrchestrator:
@@ -270,8 +296,9 @@ class ReleaseOrchestrator:
         self,
         release_id: str,
         op_name: str,
-        mutator: Callable[[ReleaseRecord, _Txn], object],
+        mutator: Callable[[ReleaseRecord, _Txn, object], object],
         expected_version: int | None = None,
+        prepare: Callable[[str, int | None], object] | None = None,
     ) -> object:
         # 第一步：非阻塞抢进程内 asyncio 锁（同一事件循环并发调用单赢家）。
         alock = self._async_locks.setdefault(release_id, asyncio.Lock())
@@ -302,10 +329,16 @@ class ReleaseOrchestrator:
                 raise AdvanceConflictError(
                     f"发布 {release_id} 已有在途操作（{op_name}），本次调用未生效"
                 )
-            # 第三步：限界等待全局提交锁（不同发布仅在毫秒级提交阶段竞争）。
+            # 第三步：全局提交锁之外的慢速准备阶段（如健康门禁探测）。
+            # 此时持有该发布的发布锁，共享状态中这条记录不会被其他实例改变，
+            # 探测再慢也只占用本发布的锁，不阻塞不相关发布的提交。
+            prepared = prepare(release_id, expected_version) if prepare else None
+            # 第四步：限界等待全局提交锁（不同发布仅在毫秒级提交阶段竞争）。
             gfd = await self._acquire_global_async(op_name, release_id)
             try:
-                return self._commit(release_id, op_name, mutator, expected_version)
+                return self._commit(
+                    release_id, op_name, mutator, expected_version, prepared
+                )
             finally:
                 self._locks.global_state().release_fd(gfd)
         finally:
@@ -337,10 +370,11 @@ class ReleaseOrchestrator:
         self,
         release_id: str,
         op_name: str,
-        mutator: Callable[[ReleaseRecord, _Txn], object],
+        mutator: Callable[[ReleaseRecord, _Txn, object], object],
         expected_version: int | None,
+        prepared: object = None,
     ) -> object:
-        # 第三步：以盘上最新快照为基准——拒绝用内存旧进度覆盖新结果。
+        # 以盘上最新快照为基准——拒绝用内存旧进度覆盖新结果。
         snap = self._read_latest()
         txn = _Txn(records=dict(snap.records), quarantined=list(snap.quarantined))
         record = txn.records.get(release_id)
@@ -348,12 +382,12 @@ class ReleaseOrchestrator:
             self._install_snapshot(snap)
             raise ReleaseNotFoundError(f"发布不存在: {release_id}")
 
-        # 第四步：乐观版本校验（调用方明确携带 expected_version 时才拒绝）。
+        # 乐观版本校验（调用方明确携带 expected_version 时才拒绝）。
         if expected_version is not None and record.version != expected_version:
             self._reject_stale(record, txn, op_name, expected_version)
 
         try:
-            result = mutator(record, txn)
+            result = mutator(record, txn, prepared)
         except BaseException:
             # 探测超时/连续失败等路径已在抛异常前完成回滚并标记 dirty，
             # 必须先落盘再把异常抛给调用方。
@@ -409,6 +443,38 @@ class ReleaseOrchestrator:
         exc.record = record  # type: ignore[attr-defined]
         raise exc
 
+    def _reject_op(
+        self,
+        record: ReleaseRecord,
+        txn: _Txn,
+        op_name: str,
+        reason: str,
+        decision: str,
+        exc: OrchestratorError,
+    ) -> None:
+        """状态拒绝留痕：调用不生效，但原因写入事件链与查询（version 也前进）。
+
+        只追加事件与刷新 updated_at——发布实际状态、当前权重、已完成批次
+        绝不因一次被拒绝的调用而改变。
+        """
+        record.updated_at = self._time()
+        self._append_event(record, "operation_rejected", {
+            "reason": reason,
+            "op": op_name,
+            "current_status": record.status.value,
+            "current_batch": record.current_batch,
+            "current_weight": record.current_weight,
+            "decision": decision,
+        })
+        txn.persist()
+        exc.record = record  # type: ignore[attr-defined]
+        logger.warning(
+            "op rejected: instance=%s id=%s op=%s reason=%s status=%s batch=%d",
+            self._instance_id, record.id, op_name, reason,
+            record.status.value, record.current_batch,
+        )
+        raise exc
+
     def _read_latest(self) -> LoadResult:
         """读盘上最新快照；文件不可读/不兼容时直接失败，绝不回写覆盖。"""
         try:
@@ -445,11 +511,42 @@ class ReleaseOrchestrator:
         self, release_id: str, *, expected_version: int | None = None
     ) -> tuple[ReleaseRecord, GateAction]:
         return await self._with_exclusive(
-            release_id, "advance", self._advance_state, expected_version
+            release_id, "advance", self._advance_state, expected_version,
+            prepare=self._prepare_advance,
         )
 
+    def _prepare_advance(
+        self, release_id: str, expected_version: int | None
+    ) -> _PreparedGate | None:
+        """提交锁外的慢速阶段：若本次推进需要过健康门禁，在此执行探测。
+
+        此时已持有该发布的发布锁，共享状态中这条记录不会被其他实例改变，
+        因此这里读到的状态与稍后提交阶段一致；探测结果由提交阶段应用。
+        探测再慢也只占用本发布的锁，不阻塞不相关发布的提交。
+        """
+        snap = self._read_latest()
+        record = snap.records.get(release_id)
+        if record is None or record.status is not ReleaseStatus.IN_PROGRESS:
+            return None  # 无需门禁的分支（启动/拒绝）由提交阶段处理
+        if expected_version is not None and record.version != expected_version:
+            return None  # 提交阶段将按 stale_version 拒绝，不浪费一次探测
+        batch = record.batches[record.current_batch - 1]
+        now = self._time()
+        elapsed = now - (batch.started_at or now)
+        if elapsed < record.plan.min_observe_seconds:
+            return None  # 观察期未满：提交阶段走 advance_rejected，不探测
+        prepared = _PreparedGate()
+        probe = self.probes.get(release_id)
+        try:
+            prepared.result = probe.probe(
+                release_id, record.plan.candidate, batch.weight
+            )
+        except ProbeTimeoutError as exc:
+            prepared.timeout = exc  # 超时回滚在提交阶段应用并落盘
+        return prepared
+
     def _advance_state(
-        self, record: ReleaseRecord, txn: _Txn
+        self, record: ReleaseRecord, txn: _Txn, prepared: _PreparedGate | None
     ) -> tuple[ReleaseRecord, GateAction]:
         status = record.status
         logger.info(
@@ -460,10 +557,19 @@ class ReleaseOrchestrator:
         )
 
         if status == ReleaseStatus.ABORTED:
-            raise ManualAbortError(f"发布 {record.id} 已被人工中止，拒绝推进")
+            self._reject_op(
+                record, txn, "advance", "already_aborted",
+                "发布已被人工中止（终态）：拒绝推进；状态、权重与批次保持不变",
+                ManualAbortError(f"发布 {record.id} 已被人工中止，拒绝推进"),
+            )
         if status in (ReleaseStatus.COMPLETED, ReleaseStatus.ROLLED_BACK):
-            raise IllegalTransitionError(
-                f"发布 {record.id} 处于终态 {status.value}，不允许推进"
+            self._reject_op(
+                record, txn, "advance", "terminal_status",
+                f"发布已处于终态 {status.value}：拒绝推进；"
+                "状态、权重与批次保持不变",
+                IllegalTransitionError(
+                    f"发布 {record.id} 处于终态 {status.value}，不允许推进"
+                ),
             )
 
         now = self._time()
@@ -474,8 +580,13 @@ class ReleaseOrchestrator:
 
         # 情况 B：暂停中 -> 需要显式 resume
         if status == ReleaseStatus.PAUSED:
-            raise DuplicateAdvanceError(
-                f"发布 {record.id} 已暂停，请先调用 resume 恢复后再推进"
+            self._reject_op(
+                record, txn, "advance", "paused_waiting_resume",
+                "发布处于暂停等待中：需先 resume 恢复；本次推进未生效，"
+                "状态、权重与批次保持不变",
+                DuplicateAdvanceError(
+                    f"发布 {record.id} 已暂停，请先调用 resume 恢复后再推进"
+                ),
             )
 
         # 情况 C：推进中
@@ -500,40 +611,45 @@ class ReleaseOrchestrator:
                 f"{record.plan.min_observe_seconds}s），本次推进不生效"
             )
 
-        # 观察期已满 -> 过健康门禁
-        return self._run_gate(record, batch, now, txn)
+        # 观察期已满 -> 过健康门禁（探测已在提交锁外完成，这里只应用结果）
+        return self._run_gate(record, batch, now, txn, prepared)
 
-    def _start_first_batch(
-        self, record: ReleaseRecord, now: float, txn: _Txn
-    ) -> tuple[ReleaseRecord, GateAction]:
-        record.status = ReleaseStatus.IN_PROGRESS
-        record.current_batch = 1
-        batch = record.batches[0]
-        batch.started_at = now
-        record.current_weight = batch.weight
-        record.active_version = record.plan.candidate
-        record.updated_at = now
-        self._append_event(record, "traffic_switched", {
-            "batch": 1, "candidate_weight": batch.weight,
-            "stable_weight": 100 - batch.weight,
-            "active_version": record.active_version,
-            "decision": "发布启动，切到首批金丝雀权重，进入观察期",
-        })
-        txn.persist()
-        logger.info(
-            "state change: id=%s PENDING -> IN_PROGRESS batch=1 weight=%d",
-            record.id, batch.weight,
+    def _gate_outcome(
+        self, record: ReleaseRecord, batch: BatchState, prepared: _PreparedGate | None
+    ) -> _PreparedGate:
+        """取本次门禁的探测结果：正常来自锁外准备阶段。
+
+        兜底：准备阶段观察期未满、提交阶段时钟刚好越过阈值（真实时钟边界
+        竞态，假时钟下不会触发）时退化为锁内探测，保证语义正确。
+        """
+        if prepared is not None and prepared.probed:
+            return prepared
+        logger.warning(
+            "gate probe fallback inside commit lock: id=%s (clock raced past "
+            "observation window between prepare and commit)", record.id,
         )
-        return record, GateAction.STARTED
-
-    def _run_gate(
-        self, record: ReleaseRecord, batch: BatchState, now: float, txn: _Txn
-    ) -> tuple[ReleaseRecord, GateAction]:
-        batch.gate_attempts += 1
+        outcome = _PreparedGate()
         probe = self.probes.get(record.id)
         try:
-            result = probe.probe(record.id, record.plan.candidate, batch.weight)
+            outcome.result = probe.probe(
+                record.id, record.plan.candidate, batch.weight
+            )
         except ProbeTimeoutError as exc:
+            outcome.timeout = exc
+        return outcome
+
+    def _run_gate(
+        self,
+        record: ReleaseRecord,
+        batch: BatchState,
+        now: float,
+        txn: _Txn,
+        prepared: _PreparedGate | None,
+    ) -> tuple[ReleaseRecord, GateAction]:
+        batch.gate_attempts += 1
+        gate = self._gate_outcome(record, batch, prepared)
+        if gate.timeout is not None:
+            exc = gate.timeout
             # 探测超时：独立异常链路 + 自动回滚
             self._append_event(record, "gate_probe_timeout", {
                 "batch": record.current_batch, "attempt": batch.gate_attempts,
@@ -542,8 +658,10 @@ class ReleaseOrchestrator:
             self._rollback(record, f"健康探测超时（第 {batch.gate_attempts} 次尝试）", now, txn)
             logger.error("gate PROBE TIMEOUT id=%s -> rollback", record.id)
             exc.record = record  # type: ignore[attr-defined]
-            raise
+            raise exc
 
+        result = gate.result
+        assert result is not None  # probed 为真时必有结果或超时
         verdict = result.verdict
         if verdict == HealthVerdict.DEGRADED:
             record.status = ReleaseStatus.PAUSED
@@ -653,6 +771,29 @@ class ReleaseOrchestrator:
         )
         return record, GateAction.ADVANCED
 
+    def _start_first_batch(
+        self, record: ReleaseRecord, now: float, txn: _Txn
+    ) -> tuple[ReleaseRecord, GateAction]:
+        record.status = ReleaseStatus.IN_PROGRESS
+        record.current_batch = 1
+        batch = record.batches[0]
+        batch.started_at = now
+        record.current_weight = batch.weight
+        record.active_version = record.plan.candidate
+        record.updated_at = now
+        self._append_event(record, "traffic_switched", {
+            "batch": 1, "candidate_weight": batch.weight,
+            "stable_weight": 100 - batch.weight,
+            "active_version": record.active_version,
+            "decision": "发布启动，切到首批金丝雀权重，进入观察期",
+        })
+        txn.persist()
+        logger.info(
+            "state change: id=%s PENDING -> IN_PROGRESS batch=1 weight=%d",
+            record.id, batch.weight,
+        )
+        return record, GateAction.STARTED
+
     # ------------------------------------------------------------------ #
     # 回滚 / 中止 / 恢复
     # ------------------------------------------------------------------ #
@@ -682,7 +823,7 @@ class ReleaseOrchestrator:
     ) -> ReleaseRecord:
         return await self._with_exclusive(
             release_id, "abort",
-            lambda rec, txn: self._abort_state(rec, reason, txn),
+            lambda rec, txn, _prepared: self._abort_state(rec, reason, txn),
             expected_version,
         )
 
@@ -691,10 +832,20 @@ class ReleaseOrchestrator:
     ) -> ReleaseRecord:
         now = self._time()
         if record.status == ReleaseStatus.ABORTED:
-            raise DuplicateAdvanceError(f"发布 {record.id} 已处于中止状态")
+            self._reject_op(
+                record, txn, "abort", "already_aborted",
+                "发布已处于中止状态（终态）：重复中止未生效；"
+                "状态、权重与批次保持不变",
+                DuplicateAdvanceError(f"发布 {record.id} 已处于中止状态"),
+            )
         if record.status in (ReleaseStatus.COMPLETED, ReleaseStatus.ROLLED_BACK):
-            raise IllegalTransitionError(
-                f"发布 {record.id} 处于终态 {record.status.value}，不允许中止"
+            self._reject_op(
+                record, txn, "abort", "terminal_status",
+                f"发布已处于终态 {record.status.value}：拒绝中止；"
+                "状态、权重与批次保持不变",
+                IllegalTransitionError(
+                    f"发布 {record.id} 处于终态 {record.status.value}，不允许中止"
+                ),
             )
         record.status = ReleaseStatus.ABORTED
         record.rollback_reason = reason or None
@@ -716,22 +867,38 @@ class ReleaseOrchestrator:
         self, release_id: str, *, expected_version: int | None = None
     ) -> ReleaseRecord:
         return await self._with_exclusive(
-            release_id, "resume", self._resume_state, expected_version
+            release_id, "resume",
+            lambda rec, txn, _prepared: self._resume_state(rec, txn),
+            expected_version,
         )
 
     def _resume_state(self, record: ReleaseRecord, txn: _Txn) -> ReleaseRecord:
         now = self._time()
         if record.status == ReleaseStatus.ABORTED:
-            raise ManualAbortError(
-                f"发布 {record.id} 已被人工中止，不可恢复（请新建发布）"
+            self._reject_op(
+                record, txn, "resume", "already_aborted",
+                "发布已被人工中止（终态）：拒绝恢复；状态、权重与批次保持不变",
+                ManualAbortError(
+                    f"发布 {record.id} 已被人工中止，不可恢复（请新建发布）"
+                ),
             )
         if record.status in (ReleaseStatus.COMPLETED, ReleaseStatus.ROLLED_BACK):
-            raise IllegalTransitionError(
-                f"发布 {record.id} 处于终态 {record.status.value}，不允许恢复"
+            self._reject_op(
+                record, txn, "resume", "terminal_status",
+                f"发布已处于终态 {record.status.value}：拒绝恢复；"
+                "状态、权重与批次保持不变",
+                IllegalTransitionError(
+                    f"发布 {record.id} 处于终态 {record.status.value}，不允许恢复"
+                ),
             )
         if record.status != ReleaseStatus.PAUSED:
-            raise IllegalTransitionError(
-                f"发布 {record.id} 当前为 {record.status.value}，仅暂停态可恢复"
+            self._reject_op(
+                record, txn, "resume", "not_paused",
+                f"发布当前为 {record.status.value}（非暂停等待中）：拒绝恢复；"
+                "状态、权重与批次保持不变",
+                IllegalTransitionError(
+                    f"发布 {record.id} 当前为 {record.status.value}，仅暂停态可恢复"
+                ),
             )
         record.status = ReleaseStatus.IN_PROGRESS
         batch = record.batches[record.current_batch - 1]
