@@ -109,9 +109,13 @@ def test_multi_process_advance_single_winner(state_path: Path):
     flat = [c for r in results for c in r["results"]]
     oks = [c for c in flat if "ok" in c]
     rejects = [c for c in flat if "err" in c]
-    actions = [c["ok"] for c in oks]
 
-    # 3 批权重：started + advanced + advanced + completed，共 4 次生效，且顺序正确
+    # 3 批权重：started + advanced + advanced + completed，共 4 次生效。
+    # 生效动作落在哪些进程上是非确定性的（取决于进程调度谁抢到每次锁），
+    # 但按提交后的 version 排序后，动作序列必须严格等于状态机顺序。
+    oks_sorted = sorted(oks, key=lambda c: c["version"])
+    actions = [c["ok"] for c in oks_sorted]
+    assert [c["version"] for c in oks_sorted] == [3, 4, 5, 6], oks_sorted
     assert actions == ["started", "advanced", "advanced", "completed"], actions
     # 其余 12 次全部明确拒绝（冲突 / 观察期未满 / 终态非法转换），没有"半生效"
     assert len(rejects) == 12
@@ -128,10 +132,21 @@ def test_multi_process_advance_single_winner(state_path: Path):
     assert sum(1 for e in final.events if e["type"] == "traffic_switched") == 3
     assert sum(1 for e in final.events if e["type"] == "release_completed") == 1
     assert [e["seq"] for e in final.events] == list(range(1, len(final.events) + 1))
-    # create + 4 次生效推进 -> version v6
-    assert final.version == 6
-    print(f"[判定] 生效 {len(oks)} 次（{actions}），拒绝 {len(rejects)} 次，"
-          f"最终 version=v{final.version}")
+    # create(v2) + 4 次生效推进(v3..v6)；进入状态机的状态性拒绝（观察期未满 /
+    # 终态拒绝）会各自留痕并让 version 再 +1，纯抢锁冲突(advance_conflict)不动版本。
+    traced_rejections = [
+        e for e in final.events
+        if e["type"] in ("advance_rejected", "operation_rejected")
+    ]
+    assert final.version == 6 + len(traced_rejections), (
+        final.version, [e["type"] for e in traced_rejections]
+    )
+    assert all(
+        e["detail"].get("current_status") in ("in_progress", "completed")
+        for e in traced_rejections if e["type"] == "operation_rejected"
+    )
+    print(f"[判定] 生效 {len(oks)} 次（{actions}），拒绝 {len(rejects)} 次"
+          f"（其中状态性留痕 {len(traced_rejections)} 次），最终 version=v{final.version}")
 
 
 def test_multi_process_abort_single_winner(state_path: Path):
@@ -428,7 +443,99 @@ def test_high_concurrency_state_integrity(state_path: Path):
 
 
 # --------------------------------------------------------------------------- #
-# 6. 同进程多实例（快速、确定性）：版本单调与旧快照保护
+# 7. 跨进程：一条发布探测变慢不连累其他发布；同发布慢探测期间仍是单赢家
+# --------------------------------------------------------------------------- #
+
+
+def test_cross_process_slow_probe_other_release_unblocked(state_path: Path):
+    """slow 发布的门禁探测阻塞 1.5s 时，另一进程对 fast 发布的推进立即生效。
+
+    旧实现把全局提交锁整段握过慢探测，fast 进程会排队 1.5s（甚至 503）；
+    新实现全局锁只在毫秒级提交阶段持有，fast 应当亚秒级 started/completed。
+    """
+    import time as _time
+
+    # 两条发布：slow（2 批，真实时间观察期 0）、fast（单批）
+    slow_id = make_release(state_path, weights=(10, 100), name="slow-svc")
+    fast_id = make_release(state_path, weights=(100,), name="fast-svc")
+    # slow 先 started（独立进程，避免和后续慢调用同进程）
+    run_instances([cfg("slow-start", state_path, slow_id, [{"op": "advance"}],
+                       fake_clock=False)])
+    assert load_final(state_path, slow_id).current_weight == 10
+
+    # slow 进程：第二次 advance 过门禁，探测固定阻塞 1.5s
+    slow_cfg = cfg(
+        "slow-probe", state_path, slow_id, [{"op": "advance"}], fake_clock=False,
+        slow_probe={"delay": 1.5},
+    )
+    # fast 进程：对完全不同的发布先 started 再 completed（两次提交）
+    fast_cfg = cfg(
+        "fast-ops", state_path, fast_id,
+        [{"op": "advance"}, {"op": "advance"}], fake_clock=False,
+    )
+
+    t0 = _time.monotonic()
+    slow_proc, fast_proc = _spawn(slow_cfg), _spawn(fast_cfg)
+    fast_out, fast_err = fast_proc.communicate(timeout=30)
+    fast_elapsed = _time.monotonic() - t0
+    assert fast_proc.returncode == 0, fast_err
+    slow_out, slow_err = slow_proc.communicate(timeout=30)
+    assert slow_proc.returncode == 0, slow_err
+
+    fast_payload = json.loads(fast_out)
+    assert "fatal" not in fast_payload, fast_payload
+    fast_calls = fast_payload["results"]
+    codes = [c.get("err") for c in fast_calls]
+    assert not any(c in ("state_commit_busy", "advance_conflict") for c in codes), fast_calls
+    assert [c["ok"] for c in fast_calls] == ["started", "completed"], fast_calls
+    # 关键：fast 没有等待 slow 的 1.5s 探测，也没被 503 拒绝
+    assert fast_elapsed < 0.8, f"无关发布被慢探测拖住 {fast_elapsed:.2f}s"
+
+    slow_payload = json.loads(slow_out)
+    assert slow_payload["results"][0]["ok"] == "advanced", slow_payload
+    final_slow = load_final(state_path, slow_id)
+    final_fast = load_final(state_path, fast_id)
+    # slow 的慢门禁通过后：完成第 1 批并切到第 2 批权重 100（尚未再过门禁，不完成）
+    assert final_slow.status is ReleaseStatus.IN_PROGRESS
+    assert final_slow.current_weight == 100 and final_slow.completed_batches == 1
+    assert final_fast.status is ReleaseStatus.COMPLETED
+    print(f"[判定] 跨进程 slow 探测 1.5s 期间，fast 发布两次操作 {fast_elapsed*1000:.0f}ms "
+          "完成，无排队无 503")
+
+
+def test_cross_process_same_release_conflict_during_slow_probe(state_path: Path):
+    """slow 进程卡在同发布门禁时，其他进程对该发布的操作立即 advance_conflict。"""
+    rid = make_release(state_path, weights=(10, 100), name="same-slow")
+    run_instances([cfg("starter", state_path, rid, [{"op": "advance"}],
+                       fake_clock=False)])
+
+    slow_cfg = cfg("slow-probe", state_path, rid, [{"op": "advance"}],
+                   fake_clock=False, slow_probe={"delay": 1.5})
+    rival_cfgs = [
+        cfg(f"rival-{i}", state_path, rid, [{"op": "advance"}], fake_clock=False)
+        for i in range(3)
+    ]
+    slow_proc = _spawn(slow_cfg)
+    # 给慢调用一点时间真正进入探测，再同时起 3 个竞争进程
+    import time as _time
+    _time.sleep(0.3)
+    rival_results = run_instances(rival_cfgs)
+    slow_out, slow_err = slow_proc.communicate(timeout=30)
+    assert slow_proc.returncode == 0, slow_err
+
+    flat = [c for r in rival_results for c in r["results"]]
+    assert all(c.get("err") == "advance_conflict" for c in flat), flat
+    slow_payload = json.loads(slow_out)
+    assert slow_payload["results"][0]["ok"] == "advanced", slow_payload
+
+    final = load_final(state_path, rid)
+    assert final.current_batch == 2 and final.current_weight == 100
+    assert sum(1 for e in final.events if e["type"] == "traffic_switched") == 2
+    print("[判定] 慢探测期间 3 个跨进程竞争调用全部立即 advance_conflict，切流仍只一次")
+
+
+# --------------------------------------------------------------------------- #
+# 8. 同进程多实例（快速、确定性）：版本单调与旧快照保护
 # --------------------------------------------------------------------------- #
 
 def _two_instances(state_path: Path, clock):

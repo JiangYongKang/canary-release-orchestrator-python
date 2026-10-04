@@ -37,7 +37,7 @@ import logging
 import threading
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Callable
 
@@ -49,6 +49,7 @@ from .errors import (
     IllegalTransitionError,
     IncompatibleStateError,
     ManualAbortError,
+    OrchestratorError,
     ProbeTimeoutError,
     ReleaseNotFoundError,
     StaleVersionError,
@@ -98,10 +99,212 @@ class _Txn:
     records: dict[str, ReleaseRecord]
     quarantined: list[QuarantinedRecord]
     dirty: bool = False
+    # 本次操作的工作态：状态机用它构造"未生效但留痕"的拒绝（可选，仅变更操作有）。
+    work: _WorkContext | None = None
 
     def persist(self) -> None:
         """状态机在实际产生变更后调用；提交器据此在结束时落盘一次。"""
         self.dirty = True
+
+
+def _acquire_global_blocking(lock: FileLock, timeout: float) -> int:
+    """在工作线程内限界等待全局提交锁（阻塞工作线程，不卡事件循环）。"""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        try:
+            return lock.acquire_nb()
+        except LockBusy:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(min(0.01, max(0.0, timeout) / 10 + 0.001))
+
+
+def _clone_record(source: ReleaseRecord) -> ReleaseRecord:
+    """深拷贝工作副本：阶段 B 对它的任何修改都不触碰缓存/盘上对象。"""
+    return replace(
+        source,
+        plan=replace(source.plan),
+        batches=[replace(b) for b in source.batches],
+        events=list(source.events),
+    )
+
+
+class _WorkContext:
+    """单次变更操作的工作态：持有工作副本，在线程内完成 A/B/C 三阶段。
+
+    - 阶段 A：读盘上最新快照、克隆目标记录（不持全局提交锁）；
+    - 阶段 B：在工作副本上跑状态机（含可能耗时数秒的健康探测），不持全局提交锁；
+    - 阶段 C：短暂持全局提交锁，重读最新快照、校验版本基线、合并并原子落盘。
+
+    全程持有该发布的 flock（同发布互斥），但全局提交锁只在毫秒级的 C 阶段持有，
+    所以一条发布的慢探测不会堵住任何其他发布。
+    """
+
+    def __init__(self, orchestrator: ReleaseOrchestrator) -> None:
+        self._o = orchestrator
+        self.record: ReleaseRecord | None = None
+        self.txn: _Txn | None = None
+
+    def run_under_release_lock(
+        self,
+        release_id: str,
+        op_name: str,
+        mutator: Callable[[ReleaseRecord, _Txn], object],
+        expected_version: int | None,
+        rfd: int,
+    ) -> object:
+        o = self._o
+        # 阶段 A：读取盘上最新快照并克隆工作副本（不持全局锁；自身记录由发布锁保护，
+        # 其他发布的并发提交只会产生更新的完整文件，读端永远读到原子完整文件）。
+        snap = o._read_latest()
+        source = snap.records.get(release_id)
+        if source is None:
+            o._install_snapshot(snap)
+            raise ReleaseNotFoundError(f"发布不存在: {release_id}")
+        base_version = source.version
+        record = _clone_record(source)
+        txn = _Txn(
+            records=dict(snap.records), quarantined=list(snap.quarantined), work=self
+        )
+        self.record, self.txn = record, txn
+
+        # 阶段 B：在工作副本上跑状态机（含可能很慢的健康探测），不持全局提交锁。
+        pending_exc: BaseException | None = None
+        try:
+            if expected_version is not None and record.version != expected_version:
+                self._reject_stale(op_name, expected_version)
+            result = mutator(record, txn)
+        except Exception as exc:
+            # 回滚/拒绝等路径在抛出前已把事件写在工作副本上并标记 dirty：
+            # 先在阶段 C 落盘，再把可区分异常抛给调用方。
+            pending_exc = exc
+        # 阶段 C：短暂持全局提交锁，重读最新快照 -> 合并工作副本 -> 原子落盘。
+        self._commit_work(base_version, op_name, release_id, pending_exc)
+        if pending_exc is not None:
+            raise pending_exc
+        return result
+
+    # ---------------------------------------------------------------- #
+    # 拒绝留痕（状态性拒绝，未带版本也要可追溯）
+    # ---------------------------------------------------------------- #
+
+    def reject(
+        self,
+        exc: OrchestratorError,
+        *,
+        reason: str,
+        op_name: str,
+        decision: str,
+    ) -> None:
+        """构造一次"未生效但留痕"的状态拒绝：追加事件、version 前进一步。
+
+        绝不改动实际状态/当前权重/已完成批次——只追加事件与 updated_at。
+        """
+        assert self.record is not None and self.txn is not None
+        record = self.record
+        now = self._o._time()
+        self._o._append_event(record, "operation_rejected", {
+            "reason": reason,
+            "op": op_name,
+            "error_code": exc.error_code,
+            "current_status": record.status.value,
+            "current_batch": record.current_batch,
+            "current_weight": record.current_weight,
+            "completed_batches": record.completed_batches,
+            "current_version": record.version,
+            "decision": decision,
+        })
+        record.updated_at = now
+        self.txn.persist()
+        # 只标记"这是一次留痕拒绝"；最终 current_version 在阶段 C 落盘（version+1）
+        # 之后再回填，保证错误响应里的版本与盘上/查询结果一致。
+        exc.record = record  # type: ignore[attr-defined]
+        exc.current_version = None  # type: ignore[attr-defined]
+        logger.warning(
+            "operation rejected (traced): instance=%s id=%s op=%s code=%s status=%s",
+            self._o._instance_id, record.id, op_name,
+            exc.error_code, record.status.value,
+        )
+        raise exc
+
+    def _reject_stale(self, op_name: str, expected_version: int) -> None:
+        assert self.record is not None
+        record = self.record
+        exc = StaleVersionError(
+            f"发布 {record.id} 的共享状态已变更（期望版本 v{expected_version}，"
+            f"当前 v{record.version}，状态 {record.status.value}），{op_name} 未生效"
+        )
+        exc.expected_version = expected_version  # type: ignore[attr-defined]
+        self.reject(
+            exc,
+            reason="stale_version",
+            op_name=op_name,
+            decision=(
+                f"调用方持有版本 v{expected_version}，共享状态已到 v{record.version}"
+                f"（{record.status.value}）：拒绝用旧进度覆盖，本次{op_name}未生效"
+            ),
+        )
+
+    # ---------------------------------------------------------------- #
+    # 阶段 C：锁内重读 -> 校验基线 -> 合并 -> 落盘
+    # ---------------------------------------------------------------- #
+
+    def _commit_work(
+        self,
+        base_version: int,
+        op_name: str,
+        release_id: str,
+        pending_exc: BaseException | None = None,
+    ) -> None:
+        o = self._o
+        assert self.record is not None and self.txn is not None
+        record, txn = self.record, self.txn
+        if not txn.dirty:
+            # 无任何变更：以阶段 A 的快照刷新缓存即可，绝不落盘（版本不动）。
+            o._install_snapshot(LoadResult(txn.records, txn.quarantined))
+            return
+
+        g_lock = o._locks.global_state()
+        try:
+            gfd = _acquire_global_blocking(g_lock, o._commit_timeout)
+        except LockBusy as lock_exc:
+            logger.warning(
+                "commit lock timeout: instance=%s id=%s op=%s after %.2fs",
+                o._instance_id, release_id, op_name, o._commit_timeout,
+            )
+            raise StateCommitBusyError(
+                f"共享状态提交锁被占用（{o._commit_timeout}s 内未获取），"
+                f"发布 {release_id} 的 {op_name} 本次未生效，可重试"
+            ) from lock_exc
+        try:
+            latest = o._read_latest()
+            current = latest.records.get(release_id)
+            if current is None or current.version != base_version:
+                # 发布锁在握却发现自己这条记录被他人改过（例如外部进程直接改写文件、
+                # 或锁语义不受支持的文件系统）：绝不用陈旧工作副本覆盖，本次未生效。
+                logger.error(
+                    "commit conflict on shared state: instance=%s id=%s op=%s "
+                    "base=v%s current=%s -> refuse to overwrite",
+                    o._instance_id, release_id, op_name, base_version,
+                    None if current is None else f"v{current.version}",
+                )
+                raise StateCommitBusyError(
+                    f"发布 {release_id} 的共享状态在操作期间被其他实例改动"
+                    f"（基线 v{base_version}），{op_name} 本次未生效，"
+                    "请重新查询后重试"
+                )
+            merged = dict(latest.records)
+            merged[release_id] = record
+            final_txn = _Txn(
+                records=merged, quarantined=list(latest.quarantined), dirty=True
+            )
+            o._write_snapshot(final_txn, record)
+            # 留痕拒绝 / 回滚异常上的版本视图必须与落盘后的最终版本一致，
+            # 这样错误响应里附带的 current_version 与随后查询看到的 version 相同。
+            if pending_exc is not None and getattr(pending_exc, "record", None) is record:
+                pending_exc.current_version = record.version  # type: ignore[attr-defined]
+        finally:
+            g_lock.release_fd(gfd)
 
 
 class ReleaseOrchestrator:
@@ -288,8 +491,9 @@ class ReleaseOrchestrator:
         # 而不是串行进入临界区后误判为"观察期未满"。
         await asyncio.sleep(0)
         # 第二步：非阻塞抢该发布的跨进程 flock——跨进程/跨线程单赢家。
+        # 此后（含可能耗时数秒的健康探测）一直持有发布锁，但**不持有全局提交锁**，
+        # 因此慢探测只会串行同一条发布，绝不会堵住其他发布。
         rlock = self._locks.for_release(release_id)
-        rfd: int | None = None
         try:
             try:
                 rfd = rlock.acquire_nb()
@@ -302,112 +506,18 @@ class ReleaseOrchestrator:
                 raise AdvanceConflictError(
                     f"发布 {release_id} 已有在途操作（{op_name}），本次调用未生效"
                 )
-            # 第三步：限界等待全局提交锁（不同发布仅在毫秒级提交阶段竞争）。
-            gfd = await self._acquire_global_async(op_name, release_id)
             try:
-                return self._commit(release_id, op_name, mutator, expected_version)
-            finally:
-                self._locks.global_state().release_fd(gfd)
-        finally:
-            if rfd is not None:
-                rlock.release_fd(rfd)
-            alock.release()
-
-    async def _acquire_global_async(self, op_name: str, release_id: str) -> int:
-        lock = self._locks.global_state()
-        deadline = time.monotonic() + self._commit_timeout
-        attempt = 0
-        while True:
-            try:
-                return lock.acquire_nb()
-            except LockBusy:
-                if time.monotonic() >= deadline:
-                    logger.warning(
-                        "commit lock timeout: instance=%s id=%s op=%s after %.2fs",
-                        self._instance_id, release_id, op_name, self._commit_timeout,
-                    )
-                    raise StateCommitBusyError(
-                        f"共享状态提交锁被占用（{self._commit_timeout}s 内未获取），"
-                        f"发布 {release_id} 的 {op_name} 本次未生效，可重试"
-                    )
-                attempt += 1
-                await asyncio.sleep(min(0.01, self._commit_timeout / 10))
-
-    def _commit(
-        self,
-        release_id: str,
-        op_name: str,
-        mutator: Callable[[ReleaseRecord, _Txn], object],
-        expected_version: int | None,
-    ) -> object:
-        # 第三步：以盘上最新快照为基准——拒绝用内存旧进度覆盖新结果。
-        snap = self._read_latest()
-        txn = _Txn(records=dict(snap.records), quarantined=list(snap.quarantined))
-        record = txn.records.get(release_id)
-        if record is None:
-            self._install_snapshot(snap)
-            raise ReleaseNotFoundError(f"发布不存在: {release_id}")
-
-        # 第四步：乐观版本校验（调用方明确携带 expected_version 时才拒绝）。
-        if expected_version is not None and record.version != expected_version:
-            self._reject_stale(record, txn, op_name, expected_version)
-
-        try:
-            result = mutator(record, txn)
-        except BaseException:
-            # 探测超时/连续失败等路径已在抛异常前完成回滚并标记 dirty，
-            # 必须先落盘再把异常抛给调用方。
-            if txn.dirty:
-                self._write_snapshot(txn, record)
-            else:
-                self._install_snapshot(
-                    LoadResult(txn.records, txn.quarantined)
+                # 状态机 + 健康探测整体放到工作线程：同步探测器即使阻塞数秒，
+                # 也不会卡住本进程事件循环（同循环内其他发布的请求照常推进）。
+                ctx = _WorkContext(self)
+                return await asyncio.to_thread(
+                    ctx.run_under_release_lock,
+                    release_id, op_name, mutator, expected_version, rfd,
                 )
-            raise
-        if txn.dirty:
-            self._write_snapshot(txn, record)
-        else:
-            self._install_snapshot(LoadResult(txn.records, txn.quarantined))
-        return result
-
-    def _reject_stale(
-        self,
-        record: ReleaseRecord,
-        txn: _Txn,
-        op_name: str,
-        expected_version: int,
-    ) -> None:
-        """陈旧版本拒绝：调用不生效，但原因写入事件链与查询（version 也前进）。"""
-        now = self._time()
-        pre_version = record.version
-        self._append_event(record, "operation_rejected", {
-            "reason": "stale_version",
-            "op": op_name,
-            "expected_version": expected_version,
-            "current_version": pre_version,
-            "current_status": record.status.value,
-            "current_batch": record.current_batch,
-            "decision": (
-                f"调用方持有版本 v{expected_version}，共享状态已到 v{pre_version}"
-                f"（{record.status.value}）：拒绝用旧进度覆盖，本次{op_name}未生效"
-            ),
-        })
-        record.updated_at = now
-        txn.persist()
-        self._write_snapshot(txn, record)
-        logger.warning(
-            "stale rejected: instance=%s id=%s op=%s expected=v%s current=v%s status=%s",
-            self._instance_id, record.id, op_name,
-            expected_version, record.version, record.status.value,
-        )
-        exc = StaleVersionError(
-            f"发布 {record.id} 的共享状态已变更（期望版本 v{expected_version}，"
-            f"当前 v{record.version}，状态 {record.status.value}），{op_name} 未生效"
-        )
-        exc.expected_version = expected_version  # type: ignore[attr-defined]
-        exc.current_version = record.version  # type: ignore[attr-defined]
-        exc.record = record  # type: ignore[attr-defined]
-        raise exc
+            finally:
+                rlock.release_fd(rfd)
+        finally:
+            alock.release()
 
     def _read_latest(self) -> LoadResult:
         """读盘上最新快照；文件不可读/不兼容时直接失败，绝不回写覆盖。"""
@@ -460,10 +570,27 @@ class ReleaseOrchestrator:
         )
 
         if status == ReleaseStatus.ABORTED:
-            raise ManualAbortError(f"发布 {record.id} 已被人工中止，拒绝推进")
+            self._reject_state(
+                txn,
+                ManualAbortError(f"发布 {record.id} 已被人工中止，拒绝推进"),
+                reason="already_aborted", op_name="advance",
+                decision=(
+                    f"发布处于 {status.value}（批次 {record.current_batch}，"
+                    f"权重 {record.current_weight}）：人工中止为终态，本次 advance 未生效"
+                ),
+            )
         if status in (ReleaseStatus.COMPLETED, ReleaseStatus.ROLLED_BACK):
-            raise IllegalTransitionError(
-                f"发布 {record.id} 处于终态 {status.value}，不允许推进"
+            self._reject_state(
+                txn,
+                IllegalTransitionError(
+                    f"发布 {record.id} 处于终态 {status.value}，不允许推进"
+                ),
+                reason="terminal_status", op_name="advance",
+                decision=(
+                    f"发布处于终态 {status.value}（已完成批次 "
+                    f"{record.completed_batches}/{len(record.batches)}，权重 "
+                    f"{record.current_weight}）：终态不可再推进，本次 advance 未生效"
+                ),
             )
 
         now = self._time()
@@ -474,8 +601,17 @@ class ReleaseOrchestrator:
 
         # 情况 B：暂停中 -> 需要显式 resume
         if status == ReleaseStatus.PAUSED:
-            raise DuplicateAdvanceError(
-                f"发布 {record.id} 已暂停，请先调用 resume 恢复后再推进"
+            self._reject_state(
+                txn,
+                DuplicateAdvanceError(
+                    f"发布 {record.id} 已暂停，请先调用 resume 恢复后再推进"
+                ),
+                reason="paused_requires_resume", op_name="advance",
+                decision=(
+                    f"发布处于 paused（批次 {record.current_batch}，权重 "
+                    f"{record.current_weight}）：暂停等待人工 resume，"
+                    "不允许直接 advance，本次未生效"
+                ),
             )
 
         # 情况 C：推进中
@@ -691,10 +827,27 @@ class ReleaseOrchestrator:
     ) -> ReleaseRecord:
         now = self._time()
         if record.status == ReleaseStatus.ABORTED:
-            raise DuplicateAdvanceError(f"发布 {record.id} 已处于中止状态")
+            self._reject_state(
+                txn,
+                DuplicateAdvanceError(f"发布 {record.id} 已处于中止状态"),
+                reason="already_aborted", op_name="abort",
+                decision=(
+                    f"发布已处于 aborted（批次 {record.current_batch}，权重 "
+                    f"{record.current_weight}）：重复中止不生效，保持冻结流量"
+                ),
+            )
         if record.status in (ReleaseStatus.COMPLETED, ReleaseStatus.ROLLED_BACK):
-            raise IllegalTransitionError(
-                f"发布 {record.id} 处于终态 {record.status.value}，不允许中止"
+            self._reject_state(
+                txn,
+                IllegalTransitionError(
+                    f"发布 {record.id} 处于终态 {record.status.value}，不允许中止"
+                ),
+                reason="terminal_status", op_name="abort",
+                decision=(
+                    f"发布处于终态 {record.status.value}（已完成批次 "
+                    f"{record.completed_batches}/{len(record.batches)}，权重 "
+                    f"{record.current_weight}）：终态不可中止，本次 abort 未生效"
+                ),
             )
         record.status = ReleaseStatus.ABORTED
         record.rollback_reason = reason or None
@@ -722,16 +875,41 @@ class ReleaseOrchestrator:
     def _resume_state(self, record: ReleaseRecord, txn: _Txn) -> ReleaseRecord:
         now = self._time()
         if record.status == ReleaseStatus.ABORTED:
-            raise ManualAbortError(
-                f"发布 {record.id} 已被人工中止，不可恢复（请新建发布）"
+            self._reject_state(
+                txn,
+                ManualAbortError(
+                    f"发布 {record.id} 已被人工中止，不可恢复（请新建发布）"
+                ),
+                reason="already_aborted", op_name="resume",
+                decision=(
+                    f"发布处于 aborted（批次 {record.current_batch}，权重 "
+                    f"{record.current_weight}）：人工中止终态不可恢复，本次 resume 未生效"
+                ),
             )
         if record.status in (ReleaseStatus.COMPLETED, ReleaseStatus.ROLLED_BACK):
-            raise IllegalTransitionError(
-                f"发布 {record.id} 处于终态 {record.status.value}，不允许恢复"
+            self._reject_state(
+                txn,
+                IllegalTransitionError(
+                    f"发布 {record.id} 处于终态 {record.status.value}，不允许恢复"
+                ),
+                reason="terminal_status", op_name="resume",
+                decision=(
+                    f"发布处于终态 {record.status.value}（已完成批次 "
+                    f"{record.completed_batches}/{len(record.batches)}，权重 "
+                    f"{record.current_weight}）：终态不可恢复，本次 resume 未生效"
+                ),
             )
         if record.status != ReleaseStatus.PAUSED:
-            raise IllegalTransitionError(
-                f"发布 {record.id} 当前为 {record.status.value}，仅暂停态可恢复"
+            self._reject_state(
+                txn,
+                IllegalTransitionError(
+                    f"发布 {record.id} 当前为 {record.status.value}，仅暂停态可恢复"
+                ),
+                reason="not_paused", op_name="resume",
+                decision=(
+                    f"发布当前为 {record.status.value}（批次 {record.current_batch}，"
+                    f"权重 {record.current_weight}）：仅 paused 可 resume，本次未生效"
+                ),
             )
         record.status = ReleaseStatus.IN_PROGRESS
         batch = record.batches[record.current_batch - 1]
@@ -751,6 +929,26 @@ class ReleaseOrchestrator:
     # ------------------------------------------------------------------ #
     # 内部工具
     # ------------------------------------------------------------------ #
+
+    def _reject_state(
+        self,
+        txn: _Txn,
+        exc: OrchestratorError,
+        *,
+        reason: str,
+        op_name: str,
+        decision: str,
+    ) -> None:
+        """状态性拒绝统一入口：留痕（事件 + version 前进）后抛出可区分异常。
+
+        仅用于已经拿到发布锁、进入状态机之后的拒绝（终态/已中止/暂停等待/非暂停恢复）。
+        纯锁竞争（advance_conflict）在更早阶段返回，绝不走这里。
+        """
+        work = txn.work
+        if work is None:
+            # 理论上不会发生（变更操作都带工作态）；防御性兜底：不丢异常。
+            raise exc
+        work.reject(exc, reason=reason, op_name=op_name, decision=decision)
 
     def _append_event(self, record: ReleaseRecord, event_type: str, detail: dict) -> None:
         event = {

@@ -65,15 +65,16 @@ _STATUS_MAP = {
 def _error_response(exc: OrchestratorError) -> JSONResponse:
     status_code = _STATUS_MAP.get(type(exc), 400)
     body: dict = {"error_code": exc.error_code, "message": str(exc)}
-    # 超时/连续失败触发了自动回滚，或陈旧版本被拒：把当前一致状态一并返回，便于解释
+    # 超时/连续失败触发了自动回滚，或陈旧版本被拒，或终态/暂停/已中止的状态性
+    # 被拒：把当前一致状态（含已前进的 version）一并返回，调用方可直接据此追溯。
     record = getattr(exc, "record", None)
     if record is not None:
         body["release"] = _record_to_view(record)
+        body["current_version"] = getattr(exc, "current_version", record.version)
         if isinstance(exc, (ProbeTimeoutError, ConsecutiveFailureError)):
             body["action"] = GateAction.ROLLED_BACK.value
     if isinstance(exc, StaleVersionError):
         body["expected_version"] = getattr(exc, "expected_version", None)
-        body["current_version"] = getattr(exc, "current_version", None)
     logger.warning("api reject: code=%s http=%d message=%s",
                    exc.error_code, status_code, exc)
     return JSONResponse(status_code=status_code, content=body)

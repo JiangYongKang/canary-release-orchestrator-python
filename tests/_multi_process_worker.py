@@ -25,6 +25,20 @@ from release_orchestrator.orchestrator import ReleaseOrchestrator  # noqa: E402
 from release_orchestrator.models import ReleasePlan  # noqa: E402
 
 
+class _SlowProbe:
+    """门禁调用固定阻塞若干秒（模拟内部指标 1~2 秒才返回），用于跨进程隔离测试。"""
+
+    def __init__(self, delay: float, verdict: str = "healthy") -> None:
+        self.delay = float(delay)
+        self.verdict = verdict
+        self.calls = 0
+
+    def probe(self, release_id, candidate, weight):
+        self.calls += 1
+        time.sleep(self.delay)
+        return HealthProbeResult(HealthVerdict[self.verdict.upper()], "slow probe")
+
+
 def _orchestrator(cfg: dict, iid: str) -> ReleaseOrchestrator:
     reg = HealthProbeRegistry()
     orch = ReleaseOrchestrator.from_path(
@@ -61,6 +75,11 @@ def _run(cfg: dict) -> dict:
     rid = cfg["release_id"]
     # 每个进程都注册永远健康的探测器（多实例下探测器是各进程本地注入的）
     orch.probes.register(rid, AlwaysHealthyProbe())
+    if cfg.get("slow_probe") is not None:
+        sp = cfg["slow_probe"]
+        orch.probes.register(
+            rid, _SlowProbe(float(sp.get("delay", 1.0)), sp.get("verdict", "healthy"))
+        )
     if cfg.get("scripted"):
         orch.probes.register(
             rid, ScriptedHealthProbe(

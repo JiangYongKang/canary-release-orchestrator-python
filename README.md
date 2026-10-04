@@ -20,7 +20,7 @@
 
 ```bash
 uv sync                                  # 安装依赖（含 pytest 开发依赖）
-uv run pytest -q                         # 运行全部本地测试（34 个，含多实例）
+uv run pytest -q                         # 运行全部本地测试（45 个，含多实例）
 uv run uvicorn main:app --port 8000      # 启动服务
 ```
 
@@ -146,12 +146,12 @@ stateDiagram-v2
 | `release_not_found` | 404 | 发布不存在 |
 | `invalid_plan` | 422 | 计划参数非法 |
 | `duplicate_release` | 409 | 重复提交同名发布 |
-| `illegal_transition` | 409 | 终态/非法状态转换 |
-| `duplicate_advance` | 409 | 观察期未满、暂停态直接推进、未达阈值的不健康、重复中止 |
-| `advance_conflict` | 409 | 同一发布已有在途操作（并发冲突，本次未生效） |
-| `stale_version` | 409 | 调用方携带的 `expected_version` 已陈旧，本次未生效（响应含 `current_version` 与最新发布状态） |
-| `state_commit_busy` | 503 | 共享状态提交锁在限定时间内未获取（本次未生效，可安全重试） |
-| `manual_abort` | 409 | 对已人工中止的发布执行推进/恢复 |
+| `illegal_transition` | 409 | 终态/非法状态转换（含非暂停态 resume）；拒绝留痕、version+1，状态不变 |
+| `duplicate_advance` | 409 | 观察期未满、暂停态直接推进、重复中止；拒绝留痕、version+1，权重不变 |
+| `advance_conflict` | 409 | 同一发布已有在途操作（并发冲突，本次未生效）；**不写事件、不动版本** |
+| `stale_version` | 409 | 调用方携带的 `expected_version` 已陈旧，本次未生效（响应含 `current_version` 与最新发布状态）；拒绝留痕、version+1 |
+| `state_commit_busy` | 503 | 共享状态提交锁在限定时间内未获取（本次未生效，可安全重试；只影响这一次提交，不连累其他发布） |
+| `manual_abort` | 409 | 对已人工中止的发布执行推进/恢复；拒绝留痕、version+1，冻结流量不变 |
 | `consecutive_failure` | 502 | 连续健康失败达阈值（已自动回滚，响应含回滚状态） |
 | `probe_timeout` | 504 | 健康探测超时（已自动回滚，响应含回滚状态） |
 
@@ -164,13 +164,19 @@ stateDiagram-v2
 
 ## 5. 并发安全（进程内）
 
-- 每个发布持有独立的 `asyncio.Lock`；`advance` / `abort` / `resume` 进入临界区前
-  做非占用检查，已有在途操作立即返回 `advance_conflict`，**同一事件循环内对同一发布
-  的并发调用只有一个有效结果**，不重复切权重、不丢状态；
-- 存储写入串行化（`threading.Lock`）并采用 `os.replace` 原子替换，避免半写文件；
+- 每个发布持有独立的 `asyncio.Lock`（同一事件循环）与跨进程 `flock` 发布锁；
+  `advance` / `abort` / `resume` 进入临界区前做非占用检查，已有在途操作立即
+  返回 `advance_conflict`，**同一事件循环内对同一发布的并发调用只有一个有效
+  结果**，不重复切权重、不丢状态；
+- 可能很慢的健康门禁探测放在**工作线程**中执行（持发布锁、不持全局提交锁），
+  同步探测器 sleep 数秒也不会卡住事件循环：同循环内其他发布的请求照常响应；
+- 存储写入串行化（`threading.Lock` + 跨进程 `global.state.lock`）并采用
+  `os.replace` 原子替换，避免半写文件；全局锁只在阶段 C 的读-合并-写瞬间持有；
 - 跨进程/多实例协作规则见第 9 节。
 - 测试 `tests/test_concurrency_recovery.py` 与 `tests/test_api_compat.py`
-  分别在编排器层（`asyncio.gather`）与 HTTP 层（多线程）验证"单赢家"语义。
+  分别在编排器层（`asyncio.gather`）与 HTTP 层（多线程）验证"单赢家"语义；
+  `tests/test_release_isolation.py` 验证慢探测不连累无关发布、慢探测期间同发布
+  仍只有一个生效，以及终态/暂停态拒绝的留痕。
 
 ## 6. 持久化、重启恢复与数据兼容
 
@@ -178,8 +184,9 @@ stateDiagram-v2
   - 以每批次 `completed` 标记为准，**已完成批次绝不重复执行**；
   - `current_batch` / 当前权重 / 活动版本 / 连续失败计数 / 暂停态 / `version` 全部恢复；
   - 回滚只可能发生一次（事件链中 `rollback` 唯一）。
-- 记录带单调递增 `version`（创建后为 2）：每次生效变更（含陈旧拒绝事件）+1，
-  供多实例做乐观并发校验（见第 9 节）。
+- 记录带单调递增 `version`（创建后为 2）：每次生效变更、以及进入状态机后的
+  状态性拒绝（终态/已中止/暂停等待/陈旧版本，见 7.3）都 +1，
+  供多实例做乐观并发校验与事后追溯（见第 9 节）。
 - 文件结构带 `schema_version`（当前 1）。**本次新增字段全部是加性变更，
   旧版本写出的状态文件无需迁移即可继续使用**。加载策略：
   - **单条记录**不兼容（字段缺失、类型错误、权重与进度自相矛盾、未知状态等）
@@ -205,17 +212,30 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
 `RELEASE_INSTANCE_ID` 可选：固定实例标识（出现在审计事件与 `GET /health` 中，
 便于区分是哪个实例执行了变更）；不指定时每进程自动生成。
 
-### 7.1 互斥与单赢家
+### 7.1 互斥与单赢家：不同发布绝不互相排队
 
 - 每个发布在 `<状态文件目录>/.locks/` 下有一把跨进程文件锁
   （`release-<id>.lock`，基于 `fcntl.flock`，由内核在持锁进程退出时自动释放）。
   `advance` / `resume` / `abort` **非阻塞抢锁**：同一发布被多个实例同时操作时，
   恰好一个调用真正执行，其余立即得到 `409 advance_conflict`（本次未生效）。
   因此同一次流量切换不会执行两遍，门禁探测不会对同一批次重复计数。
-- 另有一把毫秒级全局提交锁 `global.state.lock`，只在"重读盘上最新快照 →
-  变更 → 原子落盘"期间短暂持有。**不同发布各有独立的发布锁，互不排队堵住**。
-- 若全局提交锁在限定时限内（默认 5s）未获取，返回 `503 state_commit_busy`：
-  本次未生效、未写任何状态，调用方可安全重试。
+- 一次操作在内部拆成三段，**全局提交锁只在毫秒级的提交瞬间持有**：
+  1. 阶段 A：读盘上最新快照，克隆出本次操作的工作副本（不持全局锁）；
+  2. 阶段 B：在工作副本上跑状态机，**包括可能耗时 1～2 秒甚至更久的健康门禁探测**
+     （不持全局锁；同步探测放在工作线程执行，不会卡住本进程事件循环）；
+  3. 阶段 C：短暂持 `global.state.lock`，重读最新快照、校验版本基线、合并并
+     `os.replace` 原子落盘。
+- 由此得到的使用边界：
+  - **不同发布**：只有各自独立的发布锁，阶段 C 的全局锁持有时间是亚毫秒级，
+    所以一条发布的探测再慢，也**不会**让另一条不相关发布的推进/恢复/中止排队，
+    更不会让它拿到 `state_commit_busy`；
+  - **同一条发布**：多个实例同时操作时只有一个生效，其余立即 `advance_conflict`
+    （调用方应把它当作"本次未生效"，可重试/重新查询，而不是成功）。
+    即使其中一个调用正卡在慢探测里，其余调用也立即返回，不会长时间卡住接口；
+  - **共享状态文件的真正并发写**：不同发布在阶段 C 上短暂串行（每次提交一次
+    完整文件原子替换），限界等待默认 5s；只有在极端写入压力下这一毫秒级窗口
+    长时间拿不到锁，才会返回 `503 state_commit_busy`，且**只有那一次提交受影响**，
+    不会连累其他发布（本次未生效、未写任何状态，可安全重试）。
 
 ### 7.2 总是以共享状态最新进度为准（防陈旧覆盖）
 
@@ -226,7 +246,7 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
 - 查询接口（`GET /releases`、`GET /releases/{id}`、`/events`、`/health`）
   同样每次重读最新快照，总是反映其他实例刚提交的结果。
 
-### 7.3 乐观版本与"未生效"的可区分结果
+### 7.3 乐观版本与"未生效"的可区分、可追溯结果
 
 - 发布视图含 `version`，每次生效变更（含被记录的拒绝）单调 +1。
 - 调用方可在请求体携带 `expected_version`（推进/中止/恢复均支持，可选）。
@@ -234,12 +254,25 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
   - 返回 `409 stale_version`，响应体带 `expected_version`、`current_version`
     与最新发布完整视图，调用方据此明确知道"这次没生效"，重新查询后再决策；
   - 事件链追加一条 `operation_rejected`（`reason=stale_version`，含
-    `current_status/current_batch/decision`），**拒绝原因在查询与事件记录里都
-    看得见**，版本也前进一格。
-- 不带 `expected_version` 时保持原有按当前阶段判定的行为：对终态推进仍返回
-  `illegal_transition`、对已中止发布操作返回 `manual_abort`，同样绝不回退状态。
-- `409 advance_conflict`（锁竞争，毫秒级重试即可）不写事件、不动版本；
-  观察期未满的 `duplicate_advance` 会记录 `advance_rejected` 事件。
+    `current_status/current_batch/current_weight/completed_batches/decision`），
+    **拒绝原因在查询与事件记录里都看得见**，版本也前进一格。
+- **即使调用方没有显式带 `expected_version`，进入状态机后的"状态性拒绝"同样
+  留痕**：对已完成（`completed`）、已回滚（`rolled_back`）、已中止（`aborted`）
+  或正处在暂停等待（`paused`）的发布再次发起 `advance` / `resume` / `abort` 时——
+  - 返回的错误码仍然语义可区分：终态操作为 `illegal_transition`、
+    已中止发布的推进/恢复为 `manual_abort`、暂停态直接推进/重复中止为
+    `duplicate_advance`；
+  - 事件链都会追加一条 `operation_rejected`，`reason` 进一步区分判定依据
+    （`terminal_status` / `already_aborted` / `paused_requires_resume` /
+    `not_paused` / `stale_version`），并记录当时的 `current_status`、
+    `current_batch`、`current_weight`、`completed_batches` 与人类可读的 `decision`；
+  - 该发布的 `version` 相应 +1；错误响应体直接附带拒绝后的发布视图
+    （`release`）与 `current_version`，随后 `GET /releases/{id}` 与
+    `GET /releases/{id}/events` 也都看得到这次拒绝。
+  - **拒绝本身绝不改动发布的实际状态、当前权重与已完成批次**，只是留痕。
+- `409 advance_conflict`（同发布锁竞争，毫秒级重试即可）发生在进入状态机之前，
+  **不写事件、不动版本**；观察期未满的 `duplicate_advance` 会记录
+  `advance_rejected` 事件（包含 elapsed/required 判定依据）并让版本 +1。
 
 推荐调用姿势：先 `GET` 拿到 `version` → 操作时回传 `expected_version`；
 收到 `advance_conflict` / `state_commit_busy` 可直接重试；收到 `stale_version`
@@ -270,8 +303,12 @@ RELEASE_STATE_FILE=/data/release.json RELEASE_INSTANCE_ID=node-2 \
 # 全部测试：正常推进 / 重复请求 / 并发推进 / 重启恢复 /
 # 健康失败 / 连续失败回滚 / 探测超时回滚 / 暂停恢复 / 人工中止 /
 # 非法状态转换 / 脏数据隔离 / 入口兼容 /
+# 慢探测不连累无关发布（同循环/HTTP/跨进程）/
+# 慢探测期间同发布仍单赢家（同循环/跨进程）/
+# 终态/暂停态无版本拒绝的留痕 /
 # 多进程同发布单赢家 / 陈旧实例拒绝 / 不同发布并行 /
-# 滚动重启一致性 / 高压并发状态完整性 / 真实双 uvicorn 进程 HTTP 协作
+# 滚动重启一致性 / 高压并发状态完整性 / 同进程多实例版本单调 /
+# 真实双 uvicorn 进程 HTTP 协作
 uv run pytest -q
 ```
 
@@ -282,15 +319,17 @@ uv run pytest -q
 - **判定依据**：探测判定 `verdict / reason / metrics`、观察期 `elapsed vs required`、
   连续失败计数 `failures/threshold`、每个事件的 `decision` 文本；
 - **多实例判定**：`conflict rejected ... flock held by another instance`、
+  `operation rejected (traced) ... code=... status=...`、
   `stale rejected ... expected=vN current=vM`、`committed ... version=vK`。
 
-多实例相关测试：
+多实例 / 隔离相关测试：
 
 | 测试文件 | 覆盖 |
 | --- | --- |
-| `tests/test_multi_instance.py` | 多进程同发布推进/中止单赢家、陈旧 advance/abort/resume 拒绝、回滚终态防复活、暂停实例防覆盖、不同发布并行、滚动重启接力、高压并发状态完整性、同进程多实例版本单调 |
+| `tests/test_release_isolation.py` | **本次新增**：慢/卡住探测期间无关发布在亚秒级推进/中止成功（编排器层 gather、HTTP 多线程）；慢探测期间同发布并发操作立即 `advance_conflict` 且探测只执行一次；completed/rolled_back/aborted/paused 上无 `expected_version` 的拒绝在错误响应、查询结果、事件链中均留痕，`version` +1 而状态/权重/已完成批次不变 |
+| `tests/test_multi_instance.py` | 多进程同发布推进/中止单赢家、陈旧 advance/abort/resume 拒绝、回滚终态防复活、暂停实例防覆盖、不同发布并行、滚动重启接力、高压并发状态完整性、同进程多实例版本单调；**本次新增**跨进程慢探测（1.5s）不阻塞另一进程操作无关发布、慢探测期间跨进程竞争同发布立即冲突 |
 | `tests/test_multi_instance_http.py` | 两个真实 uvicorn 进程共享状态文件：跨进程单赢家、`stale_version` 409、事件共享、新进程重启接力 |
-| `tests/_multi_process_worker.py` | 多进程测试的子进程入口（独立文件以兼容 spawn/forkserver） |
+| `tests/_multi_process_worker.py` | 多进程测试的子进程入口（独立文件以兼容 spawn/forkserver），支持 `slow_probe` 编排慢门禁 |
 
 也可以手动起两个 uvicorn（见第 7 节开头），用 curl 分别打两个端口验证，
 包括 kill 掉一个进程后用新进程接力。
@@ -308,5 +347,5 @@ release_orchestrator/
   orchestrator.py                    # 推进状态机、门禁、回滚/中止/恢复、双层锁与版本协作
   schemas.py                         # HTTP 请求/响应模型（expected_version 可选）
   api.py                             # REST 路由与异常->错误码映射
-tests/                               # 34 个本地测试 + conftest（可控时钟/临时状态库）
+tests/                               # 45 个本地测试 + conftest（可控时钟/临时状态库）
 ```
